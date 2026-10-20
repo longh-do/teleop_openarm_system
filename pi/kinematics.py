@@ -42,15 +42,23 @@ CALIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib.jso
 
 
 def load_calib(path=CALIB_PATH):
-    """-> {arm: {"sign": np(7), "offset": np(7), "grip": {"open": rad, "closed": rad} | None, "verified": bool}}"""
-    out = {a: {"sign": np.ones(7), "offset": np.zeros(7), "grip": None, "verified": False} for a in CHAIN}
+    """-> {arm: {"sign": np(7), "offset": np(7) model rad, "limits": np(7, 2) model rad, "grip": {"open", "closed"}
+    motor rad | None, "verified": bool}}. calib.json gives offset_deg (model = sign * motor + offset) and optional
+    limits_deg {joint: [lo, hi]} overriding the model's limits (in model degrees)."""
+    out = {a: {"sign": np.ones(7), "offset": np.zeros(7), "limits": MODEL_LIMITS[a].copy(), "grip": None,
+               "verified": False} for a in CHAIN}
     if os.path.exists(path):
         with open(path) as f:
             raw = json.load(f)
         for a, c in raw.items():
-            if a in out:
-                out[a].update(sign=np.array(c["sign"], float), offset=np.array(c["offset"], float),
-                              grip=c.get("grip"), verified=bool(c.get("verified", False)))
+            if a not in out:
+                continue
+            o = out[a]
+            o["sign"] = np.array(c["sign"], float)
+            o["offset"] = np.radians(c["offset_deg"]) if "offset_deg" in c else np.array(c.get("offset", np.zeros(7)), float)
+            for j, (lo, hi) in c.get("limits_deg", {}).items():
+                o["limits"][int(j) - 1] = np.radians([lo, hi])
+            o["grip"], o["verified"] = c.get("grip"), bool(c.get("verified", False))
     return out
 
 
@@ -64,7 +72,7 @@ def to_motor(c, x):
 
 def motor_limits(arm, c, margin=0.0):
     """Joint limits in MOTOR radians (lo, hi) per joint, shrunk by margin."""
-    lim = MODEL_LIMITS[arm]
+    lim = c["limits"]
     a, b = to_motor(c, lim[:, 0] + margin), to_motor(c, lim[:, 1] - margin)
     return np.stack([np.minimum(a, b), np.maximum(a, b)], axis=1)
 
@@ -162,7 +170,7 @@ def ik(arm, c, want_p, want_R, seed_motor, iters=6, tol=2e-4, rot_weight=0.5):
     """Damped least squares from the seed (warm start), limits with a 5 deg margin (widened to admit the seed),
     then one posture step in the null space. -> (q_motor (7,), residual position error m, residual rotation rad)."""
     x = to_model(c, seed_motor)
-    lim = MODEL_LIMITS[arm]
+    lim = c["limits"]
     lo, hi = np.minimum(lim[:, 0] + MARGIN, x), np.maximum(lim[:, 1] - MARGIN, x)
     W = np.diag([1, 1, 1, rot_weight, rot_weight, rot_weight])
     for _ in range(iters):

@@ -13,7 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 import damiao as dm  # noqa: E402
 
 ARM_BUS = {"right": "can0", "left": "can1"}
-KP, KD, LEAD, SPEED, HZ = 8.0, 0.5, 0.1, 0.5, 100
+KP, KD, SPEED, HZ = 8.0, 0.5, 0.5, 100
+LEAD = float(sys.argv[2]) if len(sys.argv) > 2 else 0.1  # rad of push ahead of the position: KP * LEAD = max Nm
 STALL_S, MAX_TRAVEL, MAX_S = 0.5, 4.0, 15.0
 
 
@@ -70,8 +71,9 @@ def main():
                     raise RuntimeError(f"no stop found moving {d:+d} (at {pos:+.3f})")
                 time.sleep(1 / HZ)
             t = pos
-        # back to the start, gently
-        while abs(pos - p0) > 0.01:
+        # back to the start, gently (friction may leave it a little short: give up after 4 s)
+        t_end = time.monotonic() + 4.0
+        while abs(pos - p0) > 0.03 and time.monotonic() < t_end:
             t = min(max(p0, pos - LEAD), pos + LEAD)
             r = xfer(dm.mit(t, 0, KP, KD, 0, vmax, tmax))
             if r:

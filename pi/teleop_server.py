@@ -189,6 +189,7 @@ class Brain:
         self.last_xr, self.last_send, self.last_ts = 0.0, 0.0, 0.0
         self.xr_times, self.page_skips, self.page_fps = [], 0, 0.0
         self.prev_buttons = {}
+        self.seen = {h: {"frames": 0, "ok": 0, "sq_max": 0.0, "tr_max": 0.0, "presses": [0, 0, 0]} for h in ("left", "right")}
         self.msg = ""
         os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
         self.log = open(os.path.join(ROOT, "logs", time.strftime("brain-%Y%m%d-%H%M%S.jsonl")), "a", buffering=1 << 16)
@@ -250,6 +251,15 @@ class Brain:
             prev = self.prev_buttons.get(hand, [0, 0, 0])
             self.prev_buttons[hand] = b
             edge = [bool(x) and not bool(y) for x, y in zip(b, prev)]
+            sn = self.seen[hand]
+            sn["frames"] += 1
+            sn["ok"] += bool(H.get("ok"))
+            sn["sq_max"] = max(sn["sq_max"], float(H.get("sq", 0)))
+            sn["tr_max"] = max(sn["tr_max"], float(H.get("tr", 0)))
+            for i, e in enumerate(edge):
+                if e:
+                    sn["presses"][i] += 1
+                    self.event("button", hand=hand, button=["A/X", "B/Y", "stick"][i])
             if edge[0]:  # A / X: fine mode (re-anchor so the scale change can't jump)
                 a.fine = not a.fine
                 self.say(f"{hand}: fine mode {'on' if a.fine else 'off'}")
@@ -379,7 +389,8 @@ class Brain:
                "max_gap_ms": round(float(gaps.max()), 1), "page_fps": self.page_fps,
                "ik_p99_ms": round(float(np.percentile(ik, 99)), 2) if ik else None,
                "ik_res_max_mm": round(max((x for a in self.arms.values() for x in a.ik_res), default=0) * 1000, 1),
-               "arms": {n: {"mode": (a.tel or {}).get("mode"), "engaged": a.engaged, "fine": a.fine} for n, a in self.arms.items()}}
+               "arms": {n: {"mode": (a.tel or {}).get("mode"), "engaged": a.engaged, "fine": a.fine} for n, a in self.arms.items()},
+               "inputs": self.seen}
         self.event("stats", **rec)
         self.log.flush()
         if ts:
@@ -387,6 +398,10 @@ class Brain:
                   f"ik p99 {rec['ik_p99_ms']} ms  ik res max {rec['ik_res_max_mm']} mm  "
                   + "  ".join(f"{n}:{v['mode']}{'*' if v['engaged'] else ''}{'(fine)' if v['fine'] else ''}" for n, v in rec["arms"].items()),
                   flush=True)
+            print("    inputs: " + "  ".join(f"{h}: {v['frames']} frames ({v['ok']} tracked) squeeze max {v['sq_max']:.2f} "
+                                             f"trigger max {v['tr_max']:.2f} presses A/X,B/Y,stick {v['presses']}"
+                                             for h, v in self.seen.items()) + f"  page fps {self.page_fps}", flush=True)
+        self.seen = {h: {"frames": 0, "ok": 0, "sq_max": 0.0, "tr_max": 0.0, "presses": [0, 0, 0]} for h in ("left", "right")}
         self.xr_times = self.xr_times[-1:]
         for a in self.arms.values():
             a.ik_ms, a.ik_res = [], []

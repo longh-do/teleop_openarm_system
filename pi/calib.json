@@ -1,0 +1,18 @@
+{
+  "right": {
+    "sign": [1, 1, 1, 1, 1, 1, 1],
+    "offset_deg": [2.06, 52.99, 0.21, 57.85, 103.74, 5.15, 13.61],
+    "limits_deg": {"5": [20, 160]},
+    "grip": {"open": 0.56, "closed": -0.52},
+    "verified": true,
+    "notes": "S1 2026-10-20: model zero = arms hanging straight (photos). offset = minus the hanging rest angle, except J5 hangs a quarter turn from the model: offset = 90 - rest. Probes (user watched): J1+ fwd, J2+ out, J4+ fwd, J6+ hand in, J7- hand back, J8- closes; elbow 30 deg + J3+ forearm out; hand back 35 deg + J5+ hand in. All match sign +1. J5 limited to rest +-70 deg. Gripper stops +0.592 (open) / -0.556 (closed), 0.03 margin."
+  },
+  "left": {
+    "sign": [1, 1, 1, 1, 1, 1, 1],
+    "offset_deg": [70.06, 4.76, 10.87, 40.12, -70.14, -6.0, 4.76],
+    "limits_deg": {"5": [-160, -20]},
+    "grip": {"open": 0.50, "closed": -0.54},
+    "verified": true,
+    "notes": "S1 2026-10-20: rest read 15:49 (motors off): -70.1 -4.8 -10.9 -40.2 -19.9 +6.0 -4.8. J5 hangs a quarter turn the OTHER way from the right arm (mirror): offset = -90 - rest. Probes (user watched): J1+ back, J2- out, J4+ fwd, J6+ hand OUT, J7- hand FORWARD, J8- closes; elbow 30 + J3+ forearm in; hand tilted 35 + J5+ hand in. All match sign +1 with J5 at -90. J5 limited to rest +-70 deg. Gripper stops +0.527 (open) / -0.569 (closed)."
+  }
+}

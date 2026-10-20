@@ -35,8 +35,10 @@ import kinematics as kin  # noqa: E402
 
 ARM_BUS = {"right": "can0", "left": "can1"}
 JOINTS = range(1, 9)
-VMAX = {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 2.0, 6: 2.0, 7: 2.0, 8: 3.0}  # follower speed limit, rad/s
-AMAX = {1: 4.0, 2: 4.0, 3: 4.0, 4: 4.0, 5: 4.0, 6: 4.0, 7: 4.0, 8: 12.0}  # follower acceleration limit, rad/s^2
+# follower speed / acceleration limits. The DM4340 joints (J3, J4) follow their own position loop sluggishly
+# (S1: J4 fell 8.6 deg behind at 0.6 rad/s with only 2.8 Nm load), so they get lower limits
+VMAX = {1: 1.0, 2: 1.0, 3: 0.6, 4: 0.6, 5: 2.0, 6: 2.0, 7: 2.0, 8: 3.0}  # rad/s
+AMAX = {1: 4.0, 2: 4.0, 3: 3.0, 4: 3.0, 5: 4.0, 6: 4.0, 7: 4.0, 8: 12.0}  # rad/s^2
 PARK_V, PARK_A = 0.3, 1.0
 BLOCK_TORQUE = {1: 15.0, 2: 15.0, 3: 10.0, 4: 10.0, 5: 4.0, 6: 4.0, 7: 4.0}  # Nm, sustained -> hold
 TORQUE_CYCLES = 10  # consecutive cycles over BLOCK_TORQUE before tripping
@@ -226,7 +228,7 @@ class Arm:
             if j == 8:
                 continue
             self.err_max[j] = max(self.err_max[j], abs(self.pos[j] - self.x[j]))
-            if abs(self.pos[j] - self.x[j]) > self.args.max_err:
+            if abs(self.pos[j] - self.x[j]) > (self.args.max_err_34 if j in (3, 4) else self.args.max_err):
                 return self.hold(f"J{j} tracking error {math.degrees(self.pos[j] - self.x[j]):+.1f} deg", log, True)
             if abs(self.tau[j]) > BLOCK_TORQUE[j]:
                 self.torque_count[j] += 1
@@ -407,13 +409,17 @@ def main():
     ap.add_argument("--reply-timeout-ms", type=float, default=2.6)
     ap.add_argument("--silence-ms", type=float, default=150)
     ap.add_argument("--brain-timeout-ms", type=float, default=100)
-    ap.add_argument("--max-err", type=float, default=0.15)
+    ap.add_argument("--max-err", type=float, default=0.15, help="rad: tracking error that means blocked -> hold")
+    ap.add_argument("--max-err-34", type=float, default=0.30, help="same, for the sluggish DM4340 joints J3/J4")
     ap.add_argument("--lead-ms", type=float, default=180, help="velocity lead to cancel the motors' position-loop lag")
     ap.add_argument("--lead-ms-34", type=float, default=350, help="same, for the DM4340 joints J3/J4")
     ap.add_argument("--motor-speed-scale", type=float, default=1.0, help="x the follower vmax, sent as the posvel speed limit")
     ap.add_argument("--park-timeout", type=float, default=30)
     ap.add_argument("--read-only", action="store_true", help="never enable; print angles once a second")
-    ap.add_argument("--test", choices=["none", "hold", "sine"], default="none")
+    ap.add_argument("--test", choices=["none", "hold", "sine", "probe"], default="none")
+    ap.add_argument("--probe", default="1:12,2:5,4:15,6:15,7:12",
+                    help="probe test: joint:degrees, one joint at a time (out 1.5 s, hold 1.5 s, back 1.5 s, pause 1.5 s)")
+    ap.add_argument("--probe-base", default="", help="joint:degrees held during the whole probe (eased in/out over 3 s)")
     ap.add_argument("--duration", type=float, default=40)
     ap.add_argument("--amp-deg", type=float, default=5)
     ap.add_argument("--freq", type=float, default=0.2)
@@ -436,7 +442,9 @@ def main():
     arms = [Arm(n, args, {"grip": calib[n]["grip"]}) for n in names]
     for a in arms:
         if calib[a.name]["verified"]:
-            lim = kin.motor_limits(a.name, calib[a.name])
+            # outer safety envelope: the model's limits + 10 deg (IK keeps to the limits - 5 deg; the hanging rest
+            # pose sits right at the elbow's 0 and wanders a few degrees between power cycles)
+            lim = kin.motor_limits(a.name, calib[a.name], margin=-math.radians(10))
             a.limits = [tuple(map(float, row)) for row in lim]
         a.read_registers(log)
     rt = realtime(args.cpu, args.prio)
@@ -450,10 +458,15 @@ def main():
     udp.setblocking(False)
     tel = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-    stop_requests = {"n": 0}
+    stop_requests = {"n": 0, "t": 0.0}
 
     def on_signal(*_):
-        stop_requests["n"] += 1
+        # sudo/timeout forward a signal too, so one Ctrl-C can arrive twice: only a second one >1.5 s later
+        # means "switch off now"
+        now = time.monotonic()
+        if stop_requests["n"] == 0 or now - stop_requests["t"] > 1.5:
+            stop_requests["n"] += 1
+            stop_requests["t"] = now
 
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
@@ -470,6 +483,14 @@ def main():
     t_prev = t_next
     t_start = t_next
     test_t0, test_done = None, False
+    probe_steps = [(int(k), math.radians(float(v))) for k, v in (p.split(":") for p in args.probe.split(","))]
+    probe_base = {int(k): math.radians(float(v)) for k, v in (p.split(":") for p in args.probe_base.split(",") if p)}
+    if args.test == "probe":
+        args.duration = PROBE_STEP_S * len(probe_steps) + (2 * BASE_S if probe_base else 0)
+        if probe_base:
+            print("probe base (held throughout): " + ", ".join(f"J{j} {math.degrees(d):+.0f} deg" for j, d in probe_base.items()), flush=True)
+        print("probe schedule: " + ", ".join(f"J{j} {math.degrees(d):+.0f} deg at {i * PROBE_STEP_S:.0f}-{(i + 1) * PROBE_STEP_S:.0f} s"
+                                             for i, (j, d) in enumerate(probe_steps)), flush=True)
     test_joints = [int(j) for j in args.test_joints.split(",")]
     periods, works, late, overruns, cycles = [], [], [], 0, 0
     stat_t = t_next
@@ -519,12 +540,14 @@ def main():
             if test_t0 is not None and not test_done:
                 tt = now - test_t0
                 w, amp = 2 * math.pi * args.freq, math.radians(args.amp_deg)
+                probe_j, probe_off, base_k = probe_at(probe_steps, tt, bool(probe_base)) if args.test == "probe" else (0, 0.0, 0.0)
                 for a in arms:
                     if a.mode != "on":
                         continue
                     for j in JOINTS:
                         sine = args.test == "sine" and j in test_joints
-                        a.goal[j] = a.start_pose[j] + (amp * math.sin(w * tt) if sine else 0.0)
+                        a.goal[j] = a.start_pose[j] + (amp * math.sin(w * tt) if sine else 0.0) + (probe_off if j == probe_j else 0.0) \
+                            + base_k * probe_base.get(j, 0.0)
                         a.goal_v[j] = amp * w * math.cos(w * tt) if sine else 0.0
                         a.target_t = now
                 if tt > args.duration or handled_stops:
@@ -589,6 +612,28 @@ def main():
         log.event("exit", gaps={a.name: a.gaps[-200:] for a in arms}, misses={a.name: a.misses[1:] for a in arms})
         log.flush()
         print("all motors off. gaps:", {a.name: len(a.gaps) for a in arms}, "log:", log.path, flush=True)
+
+
+PROBE_STEP_S, BASE_S = 6.0, 3.0
+
+
+def probe_at(steps, tt, base):
+    """-> (joint, offset rad, base fraction 0..1) for the probe test at time tt.
+    With a base pose: ease into it over 3 s, run the steps, ease out over 3 s. Each step: out 1.5 s, hold 1.5 s,
+    back 1.5 s, pause 1.5 s."""
+    ease = lambda u: (1 - math.cos(math.pi * min(max(u, 0.0), 1.0))) / 2  # noqa: E731
+    k_base = 1.0
+    if base:
+        end = BASE_S + PROBE_STEP_S * len(steps)
+        k_base = ease(tt / BASE_S) if tt < BASE_S else 1.0 - ease((tt - end) / BASE_S) if tt > end else 1.0
+        tt -= BASE_S
+    i = int(tt // PROBE_STEP_S) if tt >= 0 else -1
+    if not 0 <= i < len(steps):
+        return 0, 0.0, k_base
+    j, amp = steps[i]
+    ph = tt - i * PROBE_STEP_S
+    k = ease(ph / 1.5) if ph < 1.5 else 1.0 if ph < 3.0 else 1.0 - ease((ph - 3.0) / 1.5)
+    return j, amp * k, k_base
 
 
 def pct(xs, p):
