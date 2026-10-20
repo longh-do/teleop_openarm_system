@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpenArm Quest Teleop</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; padding: 12px; background: #0b0d10; color: #f2f4f7;
+         font: 17px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 10px; }
+  h2 { font-size: 18px; margin: 0 0 8px; }
+  button { font: inherit; font-weight: 700; color: #fff; border: 0; border-radius: 12px;
+           min-height: 64px; padding: 12px 18px; cursor: pointer; touch-action: manipulation; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  #stop { display: block; width: 100%; min-height: 140px; font-size: 52px; letter-spacing: 6px;
+          background: #d0021b; box-shadow: inset 0 0 0 5px #ff6b7d; }
+  #stop:active { background: #8f0012; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
+  .row button { flex: 1 1 160px; font-size: 22px; }
+  #enter { background: #1f6feb; }
+  #power { background: #2d7a46; }
+  .card { background: #151a21; border: 1px solid #2a323d; border-radius: 12px; padding: 12px; margin: 12px 0; }
+  .grid { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; }
+  .k { color: #9aa5b1; }
+  .arms { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .arms .card { margin: 0; }
+  .mode { display: inline-block; margin-bottom: 8px; padding: 4px 12px; border-radius: 8px;
+          font-size: 22px; font-weight: 800; text-transform: uppercase; background: #4a5260; }
+  .m-on { background: #1a7f37; } .m-hold { background: #1f6feb; } .m-fault { background: #d0021b; }
+  .m-starting, .m-parking { background: #b7791f; } .m-off { background: #4a5260; }
+  .ok { color: #3fb950; } .bad { color: #ff6b6b; } .warn { color: #f2cc60; }
+  .msg { word-break: break-word; }
+  .help { color: #c9d1d9; }
+</style>
+</head>
+<body>
+<h1>OpenArm Quest Teleop</h1>
+
+<button id="stop" type="button">STOP</button>
+<div class="row">
+  <button id="enter" type="button" disabled>Enter AR</button>
+  <button id="power" type="button">Power on</button>
+</div>
+<div id="note" class="card warn" hidden></div>
+
+<div class="card grid">
+  <span class="k">WebSocket</span><span id="wsState">-</span>
+  <span class="k">XR</span><span id="xrState">checking…</span>
+  <span class="k">XR fps</span><span id="fps">-</span>
+  <span class="k">Sent / s</span><span id="sendRate">0</span>
+  <span class="k">Skipped frames</span><span id="skipped">0</span>
+  <span class="k">Server status</span><span id="statusAge">no status yet</span>
+  <span class="k">Server pose Hz</span><span id="poseHz">-</span>
+  <span class="k">Server msg</span><span id="srvMsg" class="msg">-</span>
+  <span class="k">Last command</span><span id="cmdState">-</span>
+</div>
+
+<div class="arms">
+  <div class="card">
+    <h2>Left arm</h2>
+    <span id="left-mode" class="mode">?</span>
+    <div class="grid">
+      <span class="k">Clutch</span><span id="left-clutch">-</span>
+      <span class="k">Fine</span><span id="left-fine">-</span>
+    </div>
+    <div id="left-msg" class="msg"></div>
+  </div>
+  <div class="card">
+    <h2>Right arm</h2>
+    <span id="right-mode" class="mode">?</span>
+    <div class="grid">
+      <span class="k">Clutch</span><span id="right-clutch">-</span>
+      <span class="k">Fine</span><span id="right-fine">-</span>
+    </div>
+    <div id="right-msg" class="msg"></div>
+  </div>
+</div>
+
+<p class="card help">Squeeze = move arm (hold). Trigger = gripper. A / X = fine mode.
+B = align: point the right controller in the robot's forward direction and press B.
+Y = STOP (park and power off).</p>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const HANDS = ['left', 'right'];
+const r5 = v => Math.round(v * 1e5) / 1e5;           // keep messages small
+function setText(id, text, cls) { const el = $(id); el.textContent = text; el.className = cls || ''; }
+function showNote(text) { const n = $('note'); n.textContent = text; n.hidden = false; }
+
+// ---------------- WebSocket (same origin, auto-reconnect every 1 s) ----------------
+let ws = null;
+let lastStatusAt = 0;
+
+function connect() {
+  const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+  setText('wsState', 'connecting…', 'warn');
+  let sock;
+  try { sock = new WebSocket(url); } catch (e) {
+    setText('wsState', 'error: ' + e.message, 'bad');
+    setTimeout(connect, 1000);
+    return;
+  }
+  ws = sock;
+  sock.onopen = () => setText('wsState', 'connected', 'ok');
+  sock.onclose = () => {
+    if (ws === sock) ws = null;
+    setText('wsState', 'disconnected, retrying…', 'bad');
+    setTimeout(connect, 1000);
+  };
+  sock.onmessage = ev => {
+    let m;
+    try { m = JSON.parse(ev.data); } catch (e) { return; }
+    if (m.t === 'status') renderStatus(m);
+    else if (m.t === 'haptic') pulse(m.hand, +m.i || 0, +m.ms || 0);
+  };
+}
+const wsOpen = () => ws && ws.readyState === WebSocket.OPEN;
+
+function sendCmd(cmd) {
+  const time = new Date().toLocaleTimeString();
+  if (wsOpen()) { ws.send(JSON.stringify({ t: 'cmd', cmd })); setText('cmdState', `${cmd} sent at ${time}`, 'ok'); }
+  else setText('cmdState', `${cmd} NOT SENT at ${time}: not connected`, 'bad');
+}
+
+function renderStatus(m) {
+  lastStatusAt = performance.now();
+  for (const h of HANDS) {
+    const a = (m.arms && m.arms[h]) || {};
+    const mode = String(a.mode ?? '?');
+    setText(h + '-mode', mode, 'mode m-' + mode);
+    setText(h + '-clutch', a.clutch ? 'ENGAGED' : 'off', a.clutch ? 'warn' : '');
+    setText(h + '-fine', a.fine ? 'on' : 'off', a.fine ? 'warn' : '');
+    $(h + '-msg').textContent = a.msg || '';
+  }
+  $('poseHz').textContent = typeof m.pose_hz === 'number' ? m.pose_hz.toFixed(1) : '-';
+  $('srvMsg').textContent = m.msg || '-';
+}
+
+// ---------------- Haptics ----------------
+let sources = {};   // handedness -> latest XRInputSource (rebuilt every XR frame)
+
+function pulse(hand, i, ms) {
+  const g = sources[hand] && sources[hand].gamepad;
+  if (!g) return;
+  i = Math.min(1, Math.max(0, i));
+  ms = Math.max(0, ms);
+  try {
+    const act = g.hapticActuators && g.hapticActuators[0];
+    if (act && act.pulse) { Promise.resolve(act.pulse(i, ms)).catch(() => {}); return; }
+    const vib = g.vibrationActuator;
+    if (vib && vib.playEffect) {
+      Promise.resolve(vib.playEffect('dual-rumble', { duration: ms, strongMagnitude: i, weakMagnitude: i })).catch(() => {});
+    }
+  } catch (e) { /* haptics are best-effort */ }
+}
+
+// ---------------- WebXR ----------------
+let xrMode = null, session = null, refSpace = null, gl = null, targetRate = null;
+const clutch = { left: false, right: false };    // local Schmitt-trigger clutch (feedback only)
+let seq = 0, skipped = 0, sentCount = 0;
+let fps = 0, fpsFrames = 0, fpsT0 = 0;
+
+async function initXR() {
+  if (!navigator.xr) {
+    setText('xrState', 'unavailable', 'bad');
+    showNote(window.isSecureContext
+      ? 'WebXR is not available in this browser. This page works as a control panel only.'
+      : 'WebXR needs HTTPS (a secure context). This page works as a control panel only.');
+    return;
+  }
+  try {
+    if (await navigator.xr.isSessionSupported('immersive-ar')) xrMode = 'immersive-ar';
+    else if (await navigator.xr.isSessionSupported('immersive-vr')) xrMode = 'immersive-vr';
+  } catch (e) { console.warn('isSessionSupported failed', e); }
+  if (xrMode) { setText('xrState', `ready (${xrMode})`); $('enter').disabled = false; }
+  else { setText('xrState', 'no immersive mode', 'bad'); showNote('No immersive WebXR session is supported here. Control panel only.'); }
+}
+
+$('enter').addEventListener('click', () => {
+  if (!xrMode || session) return;
+  $('enter').disabled = true;
+  setText('xrState', 'starting…', 'warn');
+  // requestSession is called directly in the click handler (needs the user gesture).
+  navigator.xr.requestSession(xrMode).then(onSessionStarted).catch(err => {
+    setText('xrState', 'failed to start', 'bad');
+    showNote('XR start failed: ' + ((err && err.message) || err));
+    $('enter').disabled = !!session;
+  });
+});
+
+async function onSessionStarted(s) {
+  session = s;
+  s.addEventListener('end', onSessionEnded);
+  try {
+    if (!gl) gl = document.createElement('canvas').getContext('webgl', { xrCompatible: true });
+    if (!gl) throw new Error('WebGL is not available');
+    if (gl.makeXRCompatible) await gl.makeXRCompatible();
+    s.updateRenderState({ baseLayer: new XRWebGLLayer(s, gl) });
+    refSpace = await s.requestReferenceSpace('local');
+  } catch (e) {
+    s.end().catch(() => {});
+    throw e;
+  }
+  setFrameRate(s);
+  fps = 0; fpsFrames = 0; fpsT0 = 0;
+  $('note').hidden = true;
+  setText('xrState', `running (${xrMode})`, 'ok');
+  s.requestAnimationFrame(onXRFrame);
+}
+
+// Ask for 90 Hz (Quest default is 72); otherwise the highest rate <= 120.
+function setFrameRate(s) {
+  targetRate = null;
+  const rates = s.supportedFrameRates ? Array.from(s.supportedFrameRates) : [];
+  if (!rates.length || !s.updateTargetFrameRate) return;
+  let target = rates.find(r => Math.abs(r - 90) < 0.5);
+  if (target === undefined) {
+    const ok = rates.filter(r => r <= 120);
+    if (!ok.length) return;
+    target = Math.max(...ok);
+  }
+  try {
+    Promise.resolve(s.updateTargetFrameRate(target)).catch(e => console.warn('updateTargetFrameRate', e));
+    targetRate = target;
+  } catch (e) { console.warn('updateTargetFrameRate', e); }
+}
+
+function onSessionEnded() {
+  session = null; refSpace = null; sources = {};
+  clutch.left = clutch.right = false;
+  fps = 0;
+  setText('xrState', 'session ended (tap Enter AR to restart)', 'warn');
+  $('enter').disabled = !xrMode;
+}
+
+function poseOut(tf) {
+  const p = tf.position, q = tf.orientation;
+  return { p: [r5(p.x), r5(p.y), r5(p.z)], q: [r5(q.x), r5(q.y), r5(q.z), r5(q.w)] };
+}
+
+function readHand(frame, src) {
+  const g = src.gamepad, b = g.buttons, ax = g.axes;
+  const H = { ok: false };
+  const pose = src.gripSpace ? frame.getPose(src.gripSpace, refSpace) : null;
+  if (pose) { H.ok = !pose.emulatedPosition; Object.assign(H, poseOut(pose.transform)); }
+  const aim = src.targetRaySpace ? frame.getPose(src.targetRaySpace, refSpace) : null;
+  if (aim) {
+    // Column-major matrix: elements 8..10 are the ray's +Z axis in 'local'; pointing direction is -Z.
+    const m = aim.transform.matrix;
+    const x = -m[8], y = -m[9], z = -m[10], n = Math.hypot(x, y, z) || 1;
+    H.aim = [r5(x / n), r5(y / n), r5(z / n)];
+  }
+  H.sq = r5(b[1] ? b[1].value : 0);
+  H.tr = r5(b[0] ? b[0].value : 0);
+  H.b = [4, 5, 3].map(i => (b[i] && b[i].pressed) ? 1 : 0);   // A/X, B/Y, stick click
+  H.stick = [r5(ax[2] ?? 0), r5(ax[3] ?? 0)];
+  return H;
+}
+
+function onXRFrame(t, frame) {
+  const s = frame.session;
+  s.requestAnimationFrame(onXRFrame);
+  try {
+    // Clear to transparent so passthrough shows; nothing else is drawn.
+    const layer = s.renderState.baseLayer;
+    if (layer) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+
+    // FPS over a 1 s window.
+    if (!fpsT0) fpsT0 = t;
+    fpsFrames++;
+    if (t - fpsT0 >= 1000) { fps = fpsFrames * 1000 / (t - fpsT0); fpsFrames = 0; fpsT0 = t; }
+
+    const vp = frame.getViewerPose(refSpace);
+    const head = vp ? poseOut(vp.transform) : null;
+
+    // Controllers: only left/right sources that have a gamepad.
+    const hands = { left: null, right: null };
+    const seen = {};
+    for (let k = 0; k < s.inputSources.length; k++) {
+      const src = s.inputSources[k];
+      // controllers only: a tracked bare hand (src.hand) must never drive an arm
+      if (src.hand || !src.gamepad || (src.handedness !== 'left' && src.handedness !== 'right')) continue;
+      seen[src.handedness] = src;
+      hands[src.handedness] = readHand(frame, src);
+    }
+    sources = seen;
+
+    // Local clutch (engage > 0.7, release < 0.3) with a haptic tick on each change.
+    for (const h of HANDS) {
+      const H = hands[h];
+      if (!H) continue;
+      if (!clutch[h] && H.sq > 0.7) { clutch[h] = true; pulse(h, 0.6, 60); }
+      else if (clutch[h] && H.sq < 0.3) { clutch[h] = false; pulse(h, 0.6, 60); }
+    }
+
+    // One message per frame; newest wins, so skip while the socket still has unsent data.
+    if (wsOpen()) {
+      if (ws.bufferedAmount > 0) skipped++;
+      else {
+        ws.send(JSON.stringify({ t: 'xr', seq: ++seq, ts: r5(performance.now()),
+          fps: Math.round(fps * 10) / 10, head, hands }));
+        sentCount++;
+      }
+    }
+  } catch (e) {
+    console.error(e);
+    showNote('XR frame error: ' + e.message);
+  }
+}
+
+// ---------------- Buttons, keyboard, 1 s UI refresh ----------------
+const stop = () => sendCmd('stop');
+$('stop').addEventListener('pointerdown', stop);                      // fire on touch-down, no delay
+$('stop').addEventListener('click', e => { if (e.detail === 0) stop(); }); // keyboard activation
+$('power').addEventListener('click', () => {
+  if (confirm('Power on both arms? Make sure the area around the arms is clear.')) sendCmd('power_on');
+});
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' || e.key === ' ' || e.key === 'Escape') { e.preventDefault(); stop(); }
+});
+// Stop Space from also "clicking" whichever button has focus.
+document.addEventListener('keyup', e => { if (e.code === 'Space' || e.key === ' ') e.preventDefault(); });
+
+setInterval(() => {
+  $('sendRate').textContent = sentCount;
+  sentCount = 0;
+  $('skipped').textContent = skipped;
+  let f = session ? fps.toFixed(1) : '-';
+  if (session && session.frameRate) f += ` (device ${session.frameRate} Hz${targetRate ? ', target ' + targetRate : ''})`;
+  $('fps').textContent = f;
+  const age = lastStatusAt ? (performance.now() - lastStatusAt) / 1000 : null;
+  if (age === null) setText('statusAge', 'no status yet', 'warn');
+  else if (age < 2) setText('statusAge', 'live', 'ok');
+  else setText('statusAge', `STALE (${age.toFixed(0)} s old)`, 'bad');
+}, 1000);
+
+connect();
+initXR();
+</script>
+</body>
+</html>
