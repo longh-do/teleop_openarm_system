@@ -73,6 +73,7 @@ class Arm:
         self.start_pose, self.park_pose, self.phase_t, self.park_t0 = None, None, 0.0, 0.0
         self.target_t, self.target_prev, self.brain_live = 0.0, None, False
         self.can_errors = 0
+        self.err_max = [0.0] * n  # per joint, reset each stats second
         self.limits = None  # motor-space (lo, hi) per joint 1-7 when calibration is verified
 
     # ---- events -------------------------------------------------------------------------------------------
@@ -116,8 +117,12 @@ class Arm:
             lead = GRIP_TORQUE / GRIP_KP
             p = clamp(self.x[8], self.pos[8] - lead, self.pos[8] + lead) if self.seen[8] else self.x[8]
             return 8, dm.mit(p, 0.0, GRIP_KP, GRIP_KD, 0.0, self.vmax_reg[8], self.tmax_reg[8])
-        speed = PARK_V if self.mode == "parking" else VMAX[j]
-        return 0x100 + j, dm.posvel(self.x[j], speed)
+        speed = PARK_V if self.mode == "parking" else VMAX[j] * self.args.motor_speed_scale
+        # the motors' own position loop trails its target like a ~0.14 s first-order lag (measured S2):
+        # command ahead by speed x lag so the joint itself lands on the follower
+        lead_ms = self.args.lead_ms_34 if j in (3, 4) else self.args.lead_ms
+        lead = self.v[j] * lead_ms / 1000 if self.mode in ("on", "parking", "hold", "fault") else 0.0
+        return 0x100 + j, dm.posvel(self.x[j] + lead, speed)
 
     def exchange(self, timeout):
         """Send one frame per joint, then collect this arm's replies until all 8 arrive or the timeout."""
@@ -220,6 +225,7 @@ class Arm:
                 return self.set_fault(f"J{j} switched itself off", log)
             if j == 8:
                 continue
+            self.err_max[j] = max(self.err_max[j], abs(self.pos[j] - self.x[j]))
             if abs(self.pos[j] - self.x[j]) > self.args.max_err:
                 return self.hold(f"J{j} tracking error {math.degrees(self.pos[j] - self.x[j]):+.1f} deg", log, True)
             if abs(self.tau[j]) > BLOCK_TORQUE[j]:
@@ -368,11 +374,13 @@ def find_other_writer():
         if pid.isdigit() and int(pid) != os.getpid():
             try:
                 with open(f"/proc/{pid}/cmdline", "rb") as f:
-                    cmd = f.read().replace(b"\0", b" ").decode(errors="replace")
+                    argv = f.read().decode(errors="replace").split("\0")
             except OSError:
                 continue
-            if "teleop_web.py" in cmd or ("motor_loop.py" in cmd and "python" in cmd and "sudo" not in cmd.split()[0]):
-                return pid, cmd.strip()
+            if not os.path.basename(argv[0]).startswith("python"):
+                continue  # shells and sudo merely mention the name
+            if any(a.endswith(("teleop_web.py", "motor_loop.py")) for a in argv[1:3]):
+                return pid, " ".join(argv).strip()
     return None
 
 
@@ -400,6 +408,9 @@ def main():
     ap.add_argument("--silence-ms", type=float, default=150)
     ap.add_argument("--brain-timeout-ms", type=float, default=100)
     ap.add_argument("--max-err", type=float, default=0.15)
+    ap.add_argument("--lead-ms", type=float, default=180, help="velocity lead to cancel the motors' position-loop lag")
+    ap.add_argument("--lead-ms-34", type=float, default=350, help="same, for the DM4340 joints J3/J4")
+    ap.add_argument("--motor-speed-scale", type=float, default=1.0, help="x the follower vmax, sent as the posvel speed limit")
     ap.add_argument("--park-timeout", type=float, default=30)
     ap.add_argument("--read-only", action="store_true", help="never enable; print angles once a second")
     ap.add_argument("--test", choices=["none", "hold", "sine"], default="none")
@@ -596,10 +607,13 @@ def stats(args, arms, periods, works, late, overruns, log, span, t_start):
            "p99_work_ms": round(pct(works, 99) * 1000, 2), "p99_wake_late_ms": round(pct(late, 99) * 1000, 3),
            "overruns": overruns,
            "arms": {a.name: {"mode": a.mode, "misses": a.misses[1:], "gaps": len(a.gaps), "can_errors": a.can_errors,
-                             "max_err_deg": round(max(abs(math.degrees(a.pos[j] - a.x[j])) for j in range(1, 8)), 2),
+                             "max_err_deg": round(math.degrees(max(a.err_max[1:8])), 2),
+                             "err_deg": [round(math.degrees(e), 2) for e in a.err_max[1:8]],
                              "max_tau": [round(a.tau[j], 1) for j in JOINTS],
                              "temp": a.temp[1:]} for a in arms}}
     log.event("stats", **rec)
+    for a in arms:
+        a.err_max = [0.0] * 9
     log.flush()
     parts = [f"{rec['hz']:6.1f} Hz", f"p99 {rec['p99_period_ms']:.2f} ms", f"max {rec['max_period_ms']:.2f}",
              f"work p99 {rec['p99_work_ms']:.2f}", f"on-time {on_time * 100:.2f}%", f"overruns {overruns}"]
