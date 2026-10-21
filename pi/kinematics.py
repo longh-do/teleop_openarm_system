@@ -166,9 +166,23 @@ def _jac(arm, x):
     return p, R, np.vstack([np.cross(a, p - o).T, a.T])
 
 
-def ik(arm, c, want_p, want_R, seed_motor, iters=6, tol=2e-4, rot_weight=0.5):
+# position mode: the cost of moving each joint (J3 upper-arm twist and the wrist are expensive, so small hand moves
+# use the shoulder and elbow like a person does), and the per-step pull toward the home posture
+JOINT_COST = np.array([1.0, 1.0, 3.0, 1.0, 4.0, 4.0, 4.0])
+HOME_PULL = np.array([0.01, 0.01, 0.03, 0.01, 0.3, 0.3, 0.3])
+# home posture (model degrees): the ready pose, forearm forward, elbow 90, wrist at rest. Not the middle of each
+# joint's range: on this rig that is an arm stuck out sideways, and pulling toward it made the arm drift on its own
+HOME_DEG = {"right": [20, 0, 0, 90, 90, 0, 0], "left": [-20, 0, 0, 90, -90, 0, 0]}
+
+
+def ik(arm, c, want_p, want_R, seed_motor, iters=6, tol=2e-4, rot_weight=0.5, mode="pose", frozen=()):
     """Damped least squares from the seed (warm start), limits with a 5 deg margin (widened to admit the seed),
-    then one posture step in the null space. -> (q_motor (7,), residual position error m, residual rotation rad)."""
+    then one posture step in the null space. -> (q_motor (7,), residual position error m, residual rotation rad).
+    mode "position": only the grasp point's position is a task; the hand's angle follows the arm, the wrist joints are
+    weighted expensive and pulled to the middle of their range (S5: holding a fixed hand angle while moving sideways
+    twisted J5 far enough to pull the J6 cable)."""
+    if mode == "position":
+        return _ik_position(arm, c, want_p, seed_motor, iters, tol, frozen)
     x = to_model(c, seed_motor)
     lim = c["limits"]
     lo, hi = np.minimum(lim[:, 0] + MARGIN, x), np.maximum(lim[:, 1] - MARGIN, x)
@@ -191,3 +205,34 @@ def ik(arm, c, want_p, want_R, seed_motor, iters=6, tol=2e-4, rot_weight=0.5):
     x = np.clip(x + (np.eye(7) - pinv @ J) @ pull, lo, hi)
     p, R, _, _ = _fk_model(arm, x)
     return to_motor(c, x), float(np.linalg.norm(want_p - p)), float(np.linalg.norm(log_rot(want_R @ R.T)))
+
+
+def _ik_position(arm, c, want_p, seed_motor, iters, tol, frozen=()):
+    x = to_model(c, seed_motor)
+    lim = c["limits"]
+    lo, hi = np.minimum(lim[:, 0] + MARGIN, x), np.maximum(lim[:, 1] - MARGIN, x)
+    w = 1 / JOINT_COST
+    for j in frozen:  # a dead motor: the solver may not use it
+        w = w.copy()
+        w[j - 1] = 0.0
+    Winv = np.diag(w)
+    for _ in range(iters):
+        p, R, J = _jac(arm, x)
+        e = want_p - p
+        if np.linalg.norm(e) < tol:
+            break
+        Jp = J[:3]
+        dx = Winv @ Jp.T @ np.linalg.solve(Jp @ Winv @ Jp.T + DAMP ** 2 * np.eye(3), e)
+        if (n := np.linalg.norm(dx)) > 0.15:
+            dx *= 0.15 / n
+        x = np.clip(x + dx, lo, hi)
+    home = np.clip(np.radians(HOME_DEG[arm]), lim[:, 0] + MARGIN, lim[:, 1] - MARGIN)
+    pull = HOME_PULL * (home - x)
+    for j in frozen:
+        pull[j - 1] = 0.0
+    _, _, J = _jac(arm, x)
+    Jp = J[:3]
+    pinv = Winv @ Jp.T @ np.linalg.inv(Jp @ Winv @ Jp.T + DAMP ** 2 * np.eye(3))
+    x = np.clip(x + (np.eye(7) - pinv @ Jp) @ pull, lo, hi)
+    p, R, _, _ = _fk_model(arm, x)
+    return to_motor(c, x), float(np.linalg.norm(want_p - p)), 0.0

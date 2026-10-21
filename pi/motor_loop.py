@@ -32,6 +32,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import damiao as dm  # noqa: E402
 import kinematics as kin  # noqa: E402
+import numpy as np  # noqa: E402
 
 ARM_BUS = {"right": "can0", "left": "can1"}
 JOINTS = range(1, 9)
@@ -44,6 +45,8 @@ BLOCK_TORQUE = {1: 15.0, 2: 15.0, 3: 10.0, 4: 10.0, 5: 4.0, 6: 4.0, 7: 4.0}  # N
 TORQUE_CYCLES = 10  # consecutive cycles over BLOCK_TORQUE before tripping
 GRIP_KP, GRIP_KD, GRIP_TORQUE = 8.0, 0.5, 1.0  # MIT gains; command clamped to +-GRIP_TORQUE/KP around the position
 JUMP_GUARD = 0.5  # rad: a target this far from the follower is refused
+BACKOFF = math.radians(3)  # rad a strained joint is backed off its obstacle on a torque trip
+TEMP_HOLD, TEMP_PARK = 70, 80  # degC (max of MOSFET / rotor): hold, then park
 GOAL_V_DECAY_S = 0.04  # forget the target's velocity estimate when targets stop for this long
 ENABLE_HOLD_S, GRACE_CYCLES = 0.5, 10
 
@@ -53,9 +56,11 @@ def clamp(x, lo, hi):
 
 
 class Arm:
-    def __init__(self, name, args, calib):
+    def __init__(self, name, args, calib, skip=()):
         self.name, self.bus, self.args = name, ARM_BUS[name], args
         self.calib = calib
+        self.skip = set(skip)  # joints left out entirely (dead motor): never commanded, never expected to reply
+        self.want = sum(1 << j for j in JOINTS if j not in self.skip)
         self.lockf = open(f"/run/lock/openarm-{self.bus}.lock", "w")
         try:
             fcntl.flock(self.lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -73,9 +78,12 @@ class Arm:
         self.torque_count = [0] * n
         self.mode, self.reason, self.epoch, self.buzz = "off", "", 0, 0
         self.start_pose, self.park_pose, self.phase_t, self.park_t0 = None, None, 0.0, 0.0
+        self.stop_t = 0.0
         self.target_t, self.target_prev, self.brain_live = 0.0, None, False
         self.can_errors = 0
         self.err_max = [0.0] * n  # per joint, reset each stats second
+        self.late = [0] * n  # replies that arrived after the reply timeout, per joint
+        self.tx_full = 0  # sends refused because the bus is not acknowledging
         self.limits = None  # motor-space (lo, hi) per joint 1-7 when calibration is verified
 
     # ---- events -------------------------------------------------------------------------------------------
@@ -86,6 +94,8 @@ class Arm:
         self.mode, self.reason = mode, reason
 
     def reset_follower(self, to_measured=True):
+        for j in self.skip:  # a skipped joint is reported at its rest angle, so FK/IK stay consistent
+            self.pos[j] = self.x[j] = self.skip_rest[j]
         for j in JOINTS:
             if to_measured:
                 self.x[j] = self.pos[j]
@@ -102,6 +112,8 @@ class Arm:
     # ---- bus ----------------------------------------------------------------------------------------------
     def read_registers(self, log):
         for j in JOINTS:
+            if j in getattr(self, "skip", ()):
+                continue
             for rid, table in ((dm.RID_VMAX, self.vmax_reg), (dm.RID_TMAX, self.tmax_reg)):
                 v = dm.read_register(self.sock, j, rid)
                 if v is not None and 0 < v < 1000:
@@ -130,16 +142,23 @@ class Arm:
         """Send one frame per joint, then collect this arm's replies until all 8 arrive or the timeout."""
         s, got = self.sock, 0
         s.setblocking(False)
-        try:  # late replies from last cycle: still valid state
+        try:  # late replies from last cycle: still valid state (counted: a "silent" joint may just be late)
             while True:
-                self._take(*dm.recv(s))
+                j = self._take(*dm.recv(s))
+                if j:
+                    self.late[j] += 1
         except BlockingIOError:
             pass
         t0 = time.monotonic()
         for j in JOINTS:
-            dm.send(s, *self.frame_for(j))
+            if j not in self.skip:
+                try:
+                    dm.send(s, *self.frame_for(j))
+                except OSError:  # TX queue full: nobody acknowledges (arm power off / cable out). Don't crash.
+                    self.tx_full += 1
+                    break
         deadline = t0 + timeout
-        while got != 0x1FE:
+        while got & self.want != self.want:
             left = deadline - time.monotonic()
             if left <= 0:
                 break
@@ -167,37 +186,64 @@ class Arm:
     # ---- per-cycle logic ----------------------------------------------------------------------------------
     def after_exchange(self, got, t0, now, log):
         silence = self.args.silence_ms / 1000
+        if self.tx_full and self.mode in ("on", "parking", "hold", "starting_hold"):
+            self.tx_full = 0
+            self.reset_follower(False)
+            self.buzz += 1
+            self.set_mode("fault", "bus not acknowledging: is the arm power off? (power on again, then Power on)", log)
+        elif self.tx_full and self.mode == "off":
+            self.tx_full = 0
         for j in JOINTS:
+            if j in self.skip:
+                continue
             if got >> j & 1:
                 if self.gap_start[j] is not None:
                     ms = (now - self.gap_start[j]) * 1000
                     self.gaps.append((j, round(ms, 1)))
-                    log.event("gap", arm=self.name, joint=j, ms=round(ms, 1), mode=self.mode)
+                    # state after the gap tells "only messages lost" (still on) from "motor rebooted/disabled" (off)
+                    log.event("gap", arm=self.name, joint=j, ms=round(ms, 1), mode=self.mode,
+                              state_after=dm.status_name(self.state[j]), q_deg=[round(math.degrees(self.pos[k]), 1) for k in JOINTS])
+                    if ms > 100:
+                        print(f"[{self.name}] J{j} answered again after {ms:.0f} ms, state {dm.status_name(self.state[j])}", flush=True)
                     self.gap_start[j] = None
             else:
                 self.misses[j] += 1
                 if self.gap_start[j] is None:
                     self.gap_start[j] = t0
-                elif self.mode in ("on", "parking") and now - self.gap_start[j] > silence:
+                    log.event("gap_start", arm=self.name, joint=j, mode=self.mode,
+                              q_deg=[round(math.degrees(self.pos[k]), 1) for k in JOINTS],
+                              cmd_deg=[round(math.degrees(self.x[k]), 1) for k in JOINTS])
+                elif self.mode == "on" and now - self.gap_start[j] > silence:
+                    # (parking rides through: it is slow, the joint is still commanded, and STOP must finish)
                     self.hold(f"J{j} silent for more than {self.args.silence_ms:.0f} ms", log)
 
     def start_sequence(self, now, log):
         """off -> starting_read (motors off, collect 8 fresh replies) -> preload -> enabling -> starting_hold -> on."""
         if self.mode == "starting_read":
-            if not all(self.seen[j] and self.gap_start[j] is None for j in JOINTS):
+            if not all(self.seen[j] and self.gap_start[j] is None for j in JOINTS if j not in self.skip):
                 if now - self.phase_t > 1.0:
                     self.set_mode("off", "can't power on: not every joint is answering", log)
                 return
-            bad = [j for j in JOINTS if self.state[j] >= 8]
+            bad = [j for j in JOINTS if self.state[j] >= 8 and j not in self.skip]
             if bad:
                 self.set_mode("off", f"can't power on: J{bad[0]} reports {dm.status_name(self.state[bad[0]])}", log)
                 return
             if self.limits is not None:
-                out = [j for j in range(1, 8) if not self.limits[j - 1][0] <= self.pos[j] <= self.limits[j - 1][1]]
+                # a joint left a little outside its window (after a fall, or someone turning it by hand) may start:
+                # its window widens to include where it is, so nothing is ever pulled toward the edge. Only a
+                # reading far outside (a calibration or data error) refuses.
+                far = math.radians(45)
+                out = [j for j in range(1, 8) if j not in self.skip and
+                       not self.limits[j - 1][0] - far <= self.pos[j] <= self.limits[j - 1][1] + far]
                 if out:
                     j = out[0]
-                    self.set_mode("off", f"can't power on: J{j} at {math.degrees(self.pos[j]):+.1f} deg is outside its limits", log)
+                    self.set_mode("off", f"can't power on: J{j} at {math.degrees(self.pos[j]):+.1f} deg is far outside its limits", log)
                     return
+                for j in range(1, 8):
+                    lo, hi = self.limits[j - 1]
+                    if not lo <= self.pos[j] <= hi:
+                        log.event("widened", arm=self.name, joint=j, pos_deg=round(math.degrees(self.pos[j]), 1))
+                    self.limits[j - 1] = (min(lo, self.pos[j]), max(hi, self.pos[j]))
             self.reset_follower(True)
             if self.start_pose is None:
                 self.start_pose = list(self.pos)
@@ -210,16 +256,30 @@ class Arm:
             self.phase_t = now
             self.set_mode("starting_hold", "holding 0.5 s", log)
         elif self.mode == "starting_hold" and now - self.phase_t > ENABLE_HOLD_S:
-            self.target_t, self.brain_live = 0.0, False
+            self.target_t, self.brain_live, self.stop_t = 0.0, False, 0.0
             self.set_mode("on", "ready", log)
 
     def safety(self, now, log):
+        if self.mode in ("on", "parking", "hold", "fault", "starting_hold"):
+            hot = max(range(1, 9), key=lambda j: self.temp[j])
+            t = self.temp[hot]
+            if t >= TEMP_PARK and self.mode in ("on", "hold", "fault"):
+                self.command("stop", now, log)
+                self.reason = f"J{hot} at {t} degC: parking to cool down"
+                log.event("overheat", arm=self.name, joint=hot, temp=t)
+                return
+            if t >= TEMP_HOLD and self.mode == "on":
+                return self.hold(f"J{hot} is hot ({t} degC): let it cool", log, True)
+        if self.mode == "fault" and all(self.state[j] == 0 and self.gap_start[j] is None for j in JOINTS if j not in self.skip):
+            # every motor answers "off": the arm lost power (or was switched off) and is limp already
+            self.set_mode("off", "all motors are off (arm power was cut?): press Power on", log)
+            return
         if self.mode not in ("on", "parking", "starting_hold"):
             return
         grace = self.mode == "starting_hold" and now - self.phase_t < GRACE_CYCLES / self.args.hz
         for j in JOINTS:
-            if self.gap_start[j] is not None:
-                continue  # stale this cycle: ride through
+            if self.gap_start[j] is not None or j in self.skip:
+                continue  # stale this cycle: ride through (skipped joints are never judged)
             st = self.state[j]
             if st >= 8:
                 return self.set_fault(f"J{j} reports {dm.status_name(st)}", log)
@@ -230,11 +290,18 @@ class Arm:
             self.err_max[j] = max(self.err_max[j], abs(self.pos[j] - self.x[j]))
             if abs(self.pos[j] - self.x[j]) > (self.args.max_err_34 if j in (3, 4) else self.args.max_err):
                 return self.hold(f"J{j} tracking error {math.degrees(self.pos[j] - self.x[j]):+.1f} deg", log, True)
+            if self.mode == "parking":
+                continue  # parking is slow; a blocked joint shows up as tracking error, and park must not be stopped by strain
             if abs(self.tau[j]) > BLOCK_TORQUE[j]:
                 self.torque_count[j] += 1
                 if self.torque_count[j] >= TORQUE_CYCLES:
                     self.torque_count[j] = 0
-                    return self.hold(f"J{j} torque {self.tau[j]:+.1f} Nm (blocked?)", log, True)
+                    tau = self.tau[j]
+                    self.hold(f"J{j} torque {tau:+.1f} Nm (blocked?)", log, True)
+                    # back the strained joint off its obstacle so it stops pressing while it holds (S5: J7 pressed
+                    # its end stop at 5 Nm in hold and reached 91 degC)
+                    self.x[j] = self.goal[j] = self.pos[j] - math.copysign(BACKOFF, tau)
+                    return
             else:
                 self.torque_count[j] = 0
 
@@ -267,7 +334,8 @@ class Arm:
             for j in JOINTS:
                 self.goal_v[j] = 0.0
         for j in JOINTS:
-            self.goal[j] = goal[j - 1]
+            if j not in self.skip:
+                self.goal[j] = goal[j - 1]
         if not self.brain_live:
             self.reason = "following the brain"
         self.target_prev, self.target_t, self.brain_live = goal, now, True
@@ -323,7 +391,11 @@ class Arm:
         if cmd == "power_on" and self.mode == "off":
             self.phase_t = now
             self.set_mode("starting_read", "reading joints (motors off)", log)
+        elif cmd == "stop" and self.stop_t and 2.0 < now - self.stop_t < 20.0 and self.mode in ("parking", "hold", "fault"):
+            # a second STOP while the first has not finished parking: switch off now (the arm goes limp)
+            self.set_mode("off", "second STOP: motors off", log)
         elif cmd == "stop" and self.mode in ("on", "hold", "fault", "starting_hold"):
+            self.stop_t = now
             self.reset_follower(self.mode != "on")
             for j in JOINTS:
                 self.goal[j] = self.park_pose[j]
@@ -332,14 +404,14 @@ class Arm:
         elif cmd == "stop" and self.mode in ("starting_read", "preload", "enabling"):
             self.set_mode("off", "STOP during start", log)
         elif cmd == "resume" and self.mode == "hold":
-            self.reset_follower(False)
+            self.reset_follower(True)  # from where the joints really are
             self.set_mode("on", "resumed", log)
         elif cmd == "estop" and self.mode != "off":
             self.set_mode("off", "E-STOP: motors off", log)
 
     def telemetry(self):
         r = lambda a: [round(a[j], 4) for j in JOINTS]  # noqa: E731
-        return {"mode": self.mode, "reason": self.reason, "epoch": self.epoch, "buzz": self.buzz,
+        return {"mode": self.mode, "reason": self.reason, "epoch": self.epoch, "buzz": self.buzz, "skip": sorted(self.skip),
                 "x": r(self.x), "q": r(self.pos), "tau": [round(self.tau[j], 2) for j in JOINTS],
                 "st": self.state[1:], "temp": self.temp[1:], "stale": [self.gap_start[j] is not None for j in JOINTS],
                 "misses": self.misses[1:], "can_errors": self.can_errors}
@@ -405,6 +477,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--arms", default="left,right")
     ap.add_argument("--buses", default="right=can0,left=can1", help="arm=bus map (vcan for the simulator)")
+    ap.add_argument("--skip", default="", help="dead motors to leave out, e.g. left:6 (never commanded; held at rest in the model)")
     ap.add_argument("--hz", type=float, default=200)
     ap.add_argument("--reply-timeout-ms", type=float, default=2.6)
     ap.add_argument("--silence-ms", type=float, default=150)
@@ -439,8 +512,21 @@ def main():
         sys.exit(f"another program drives the arm buses (pid {other[0]}: {other[1][:80]}). Stop it first.")
     calib = kin.load_calib()
     log = Log(os.path.join(args.log_dir, time.strftime("motor-%Y%m%d-%H%M%S.jsonl")))
-    arms = [Arm(n, args, {"grip": calib[n]["grip"]}) for n in names]
+    skips = {}
+    for item in filter(None, args.skip.split(",")):
+        arm_name, j = item.split(":")
+        skips.setdefault(arm_name, []).append(int(j))
+    arms = [Arm(n, args, {"grip": calib[n]["grip"]}, skips.get(n, ())) for n in names]
     for a in arms:
+        rest = kin.to_motor(calib[a.name], np.zeros(7))
+        a.skip_rest = {j: float(rest[j - 1]) for j in a.skip}
+        for j in a.skip:
+            a.pos[j] = a.x[j] = a.goal[j] = a.skip_rest[j]
+            a.seen[j] = True
+            a.state[j] = 1
+        if a.skip:
+            print(f"[{a.name}] leaving out J{', J'.join(map(str, sorted(a.skip)))} (dead motor): held at its rest angle in the model", flush=True)
+            log.event("skip", arm=a.name, joints=sorted(a.skip))
         if calib[a.name]["verified"]:
             # outer safety envelope: the model's limits + 10 deg (IK keeps to the limits - 5 deg; the hanging rest
             # pose sits right at the elbow's 0 and wanders a few degrees between power cycles)
@@ -651,7 +737,7 @@ def stats(args, arms, periods, works, late, overruns, log, span, t_start):
            "max_period_ms": round(max(periods, default=0) * 1000, 2), "on_time": round(on_time, 4),
            "p99_work_ms": round(pct(works, 99) * 1000, 2), "p99_wake_late_ms": round(pct(late, 99) * 1000, 3),
            "overruns": overruns,
-           "arms": {a.name: {"mode": a.mode, "misses": a.misses[1:], "gaps": len(a.gaps), "can_errors": a.can_errors,
+           "arms": {a.name: {"mode": a.mode, "misses": a.misses[1:], "late": a.late[1:], "gaps": len(a.gaps), "can_errors": a.can_errors,
                              "max_err_deg": round(math.degrees(max(a.err_max[1:8])), 2),
                              "err_deg": [round(math.degrees(e), 2) for e in a.err_max[1:8]],
                              "max_tau": [round(a.tau[j], 1) for j in JOINTS],

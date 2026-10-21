@@ -28,6 +28,7 @@ def main():
     ap.add_argument("bus")
     ap.add_argument("--drop-j1", type=float, default=0, help="J1 silent ~35 ms every N s (0 = never)")
     ap.add_argument("--start", default="0,-0.5,0,0.8,0,0,0,0.3")
+    ap.add_argument("--dead", type=int, default=0, help="this joint never answers")
     args = ap.parse_args()
     s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
     s.bind((args.bus,))
@@ -71,7 +72,7 @@ def main():
                 mit_kp[j] = dm.to_float(d[3] << 8 & 0xF00 | d[4], 0, 500, 12)
         else:
             continue
-        if j == 1 and now < drop_until:
+        if j == 1 and now < drop_until or j == args.dead:
             continue
         tau = 0.5 * math.sin(now) if on[j] else 0.0
         s.send(struct.pack(dm.FRAME, 0x10 + j, 8, encode_reply(j, int(on[j]), pos[j], vel[j], tau, dm.VMAX[j], dm.TMAX[j])))
