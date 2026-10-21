@@ -7,7 +7,7 @@ Open https://<pi-ip>:8443 on the Quest (Advanced -> Proceed once), press Enter A
 
 Controls: squeeze = clutch (hold to drive that arm), trigger = gripper, A/X = fine mode,
 B = align: stand beside the robot FACING THE SAME WAY IT FACES, point the right controller straight ahead, press B.
-Y = STOP (park + power off).
+Y = STOP (park + power off). Thumbstick click = ready pose; hold a thumbstick 1 s while the arms are off = power on.
 """
 import argparse
 import asyncio
@@ -36,6 +36,9 @@ XR_TIMEOUT = 0.15  # s without controller data -> disengage
 # is singular (it can't move straight up), so S5+ start here. Left J1 and J5 are mirrored.
 READY_MODEL_DEG = kin.HOME_DEG  # same pose the position-mode IK is pulled toward
 READY_SPEED = 0.3  # rad/s, fastest joint during the ready move
+# joint speed the motor loop's follower allows (motor_loop VMAX); IK steps are kept under 90% of it, so the brain
+# never asks for a jump the loop would refuse (19:36: from the straight-down pose the IK asked J4 for 29 deg at once)
+LOOP_VMAX = np.array([1.0, 1.0, 0.6, 0.6, 2.0, 2.0, 2.0])
 GRIP_RATE = 3.0  # rad/s
 
 
@@ -110,6 +113,8 @@ class ArmBrain:
         self.ik_ms, self.ik_res = [], []
         self.traj = None  # (q_from, q_to, t0, duration): a joint-space move the brain plays (ready pose)
         self.resume_t = -10.0
+        self.auto_ready = False
+        self.stick_t = None  # when this hand's thumbstick went down (hold 1 s with the arms off = power on)
 
     def start_ready(self, now):
         if not self.on or self.q_cmd is None:
@@ -131,7 +136,10 @@ class ArmBrain:
     def on_tel(self, t, now):
         """New telemetry. If the loop reset its follower (epoch changed), re-sync and drop the clutch."""
         first = self.tel is None
+        prev_mode = None if first else self.tel["mode"]
         self.tel, self.tel_t = t, now
+        if t["mode"] == "on" and t["reason"] == "ready" and prev_mode != "on":
+            self.auto_ready = True  # just powered on: hanging straight down is a bad pose to drive from
         if t["epoch"] != self.epoch:
             self.epoch = t["epoch"]
             self.traj = None
@@ -191,6 +199,12 @@ class ArmBrain:
                                  frozen=(self.tel or {}).get("skip", ()))
         self.ik_ms.append((time.perf_counter() - t0) * 1000)
         self.ik_res.append(res_p)
+        dq = q - self.q_cmd
+        over = float(np.max(np.abs(dq) / (0.9 * LOOP_VMAX * dt)))
+        if over > 1.0:  # too fast for the joints: take the same direction, smaller step, and re-anchor the pose
+            q = self.q_cmd + dq / over
+            self.ee_p, self.ee_R = kin.fk(self.name, self.calib, q)
+            res_p = 0.0
         self.q_cmd = q
         self.trace["q_model_deg"] = [round(float(v), 1) for v in np.degrees(kin.to_model(self.calib, q))]
         self.trace["res_mm"] = round(res_p * 1000, 1)
@@ -221,6 +235,7 @@ class Brain:
         self.ws = set()
         self.last_xr, self.last_send, self.last_ts = 0.0, 0.0, 0.0
         self.xr_times, self.page_skips, self.page_fps = [], 0, 0.0
+        self.src_ts = []
         self.prev_buttons = {}
         self.seen = {h: {"frames": 0, "ok": 0, "sq_max": 0.0, "tr_max": 0.0, "presses": [0, 0, 0]} for h in ("left", "right")}
         self.msg = ""
@@ -279,6 +294,7 @@ class Brain:
         dt = min(max((ts - self.last_ts) / 1000, 1e-3), 0.05) if self.last_ts else 1 / 72
         self.last_xr, self.last_ts = now, ts
         self.xr_times.append(now)
+        self.src_ts.append(ts)  # headset clock: gaps here are the headset skipping frames, not the link
         self.page_fps = m.get("fps", 0)
         if now - getattr(self, "sample_t", 0.0) > 1.0:  # one raw sample a second, for debugging the headset side
             self.sample_t = now
@@ -323,6 +339,17 @@ class Brain:
                     await self.haptic("right", "align")
             if edge[1] and hand == "left":  # Y: STOP
                 await self.stop("Y button")
+            if b[2] and a.stick_t is None:
+                a.stick_t = now
+            elif not b[2]:
+                a.stick_t = None
+            all_off = all(o.tel is not None and o.tel["mode"] == "off" for o in self.arms.values() if o.tel is not None) \
+                and any(o.tel is not None for o in self.arms.values())
+            if all_off and a.stick_t is not None and now - a.stick_t > 1.0:
+                a.stick_t = now + 3600  # once per press
+                self.to_loop({"t": "cmd", "cmd": "power_on", "arm": "all"})
+                self.say("thumbstick held: power on (the arms will rise to the ready pose)")
+                await self.haptic(hand, "align")
             if edge[2] and a.tel is not None and a.tel["mode"] == "hold":  # thumbstick in hold: resume, then ready pose
                 self.to_loop({"t": "cmd", "cmd": "resume", "arm": hand})
                 a.ready_after_resume = True
@@ -445,6 +472,11 @@ class Brain:
                     if a.engaged:
                         a.engaged = False
                         self.say(f"{a.name}: no headset data, holding")
+            for a in self.arms.values():
+                if a.auto_ready and a.on and a.q_cmd is not None and not a.engaged:
+                    a.auto_ready = False
+                    if a.start_ready(now):
+                        self.say(f"{a.name}: powered on, moving to the ready pose")
             busy = any(a.traj is not None for a in self.arms.values())
             if now - self.last_send > (0.008 if busy else 0.035):
                 self.send_targets()
@@ -459,8 +491,11 @@ class Brain:
         ts = self.xr_times
         gaps = np.diff(ts) * 1000 if len(ts) > 1 else np.array([0.0])
         ik = [x for a in self.arms.values() for x in a.ik_ms]
+        sg = np.diff(self.src_ts) if len(self.src_ts) > 1 else np.array([0.0])
         rec = {"pose_hz": round(len(ts) / span, 1), "p99_gap_ms": round(float(np.percentile(gaps, 99)), 1),
                "max_gap_ms": round(float(gaps.max()), 1), "page_fps": self.page_fps,
+               "src_p99_gap_ms": round(float(np.percentile(sg, 99)), 1), "src_max_gap_ms": round(float(sg.max()), 1),
+               "remote": getattr(self, "last_remote", None),
                "ik_p99_ms": round(float(np.percentile(ik, 99)), 2) if ik else None,
                "ik_res_max_mm": round(max((x for a in self.arms.values() for x in a.ik_res), default=0) * 1000, 1),
                "arms": {n: {"mode": (a.tel or {}).get("mode"), "engaged": a.engaged, "fine": a.fine} for n, a in self.arms.items()},
@@ -477,6 +512,7 @@ class Brain:
                                              for h, v in self.seen.items()) + f"  page fps {self.page_fps}", flush=True)
         self.seen = {h: {"frames": 0, "ok": 0, "sq_max": 0.0, "tr_max": 0.0, "presses": [0, 0, 0]} for h in ("left", "right")}
         self.xr_times = self.xr_times[-1:]
+        self.src_ts = self.src_ts[-1:]
         for a in self.arms.values():
             a.ik_ms, a.ik_res = [], []
 
@@ -496,6 +532,7 @@ async def ws_handler(request):
             except ValueError:
                 continue
             if m.get("t") == "xr":
+                brain.last_remote = request.remote
                 await brain.on_xr(m)
             elif m.get("t") == "cmd":
                 await brain.on_cmd(m)

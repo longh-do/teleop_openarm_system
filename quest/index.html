@@ -80,9 +80,10 @@
   </div>
 </div>
 
-<p class="card help">Squeeze = move arm (hold). Trigger = gripper. A / X = fine mode.
-B = align: point the right controller in the robot's forward direction and press B.
-Y = STOP (park and power off).</p>
+<p class="card help">Start: Power on (here) → Enter AR → the arms rise to the ready pose by themselves → B to align.
+Squeeze = move arm (hold). Trigger = gripper. A / X = fine mode.
+B = align: stand beside the robot facing the way it faces, point the right controller straight ahead, press B.
+Y = STOP (park and power off). Arms off? Hold a thumbstick 1 s to power on again. Thumbstick click = ready pose.</p>
 
 <script>
 'use strict';
@@ -344,7 +345,7 @@ const stop = () => sendCmd('stop');
 $('stop').addEventListener('pointerdown', stop);                      // fire on touch-down, no delay
 $('stop').addEventListener('click', e => { if (e.detail === 0) stop(); }); // keyboard activation
 $('power').addEventListener('click', () => {
-  if (confirm('Power on both arms? Make sure the area around the arms is clear.')) sendCmd('power_on');
+  if (confirm('Power on both arms? They will raise their forearms to point forward. Make sure the area around the arms is clear.')) sendCmd('power_on');
 });
 document.addEventListener('keydown', e => {
   if (e.code === 'Space' || e.key === ' ' || e.key === 'Escape') { e.preventDefault(); stop(); }
