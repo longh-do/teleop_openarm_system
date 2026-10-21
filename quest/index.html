@@ -45,6 +45,7 @@
   <button id="power" type="button">Power on</button>
 </div>
 <div id="note" class="card warn" hidden></div>
+<pre id="xrLog" class="card" style="white-space:pre-wrap;font-size:12px;max-height:30vh;overflow:auto;margin:8px 0"></pre>
 
 <div class="card grid">
   <span class="k">WebSocket</span><span id="wsState">-</span>
@@ -115,7 +116,12 @@ function connect() {
     let m;
     try { m = JSON.parse(ev.data); } catch (e) { return; }
     if (m.t === 'status') renderStatus(m);
-    else if (m.t === 'haptic') pulse(m.hand, +m.i || 0, +m.ms || 0);
+    else if (m.t === 'haptic') {
+      // pattern = [[intensity, ms, gap_ms], ...] so each event feels different; plain {i, ms} = one pulse
+      const steps = Array.isArray(m.pattern) ? m.pattern : [[+m.i || 0, +m.ms || 0, 0]];
+      let at = 0;
+      for (const [i, ms, gap] of steps) { setTimeout(() => pulse(m.hand, i, ms), at); at += ms + (gap || 0); }
+    }
   };
 }
 const wsOpen = () => ws && ws.readyState === WebSocket.OPEN;
@@ -192,9 +198,23 @@ $('enter').addEventListener('click', () => {
   });
 });
 
+const isController = src => !!src.gamepad && !src.hand && src.gamepad.axes.length >= 4 &&
+  (src.handedness === 'left' || src.handedness === 'right') && !src.profiles.some(p => p.includes('hand'));
+const t0 = performance.now();
+function xrlog(...a) {   // also readable from the laptop over adb + devtools (tools/quest_cdp.py watch)
+  const line = ((performance.now() - t0) / 1000).toFixed(1) + 's ' + a.join(' ');
+  console.log(line);
+  $('xrLog').textContent = (line + '\n' + $('xrLog').textContent).slice(0, 1500);
+}
+
 async function onSessionStarted(s) {
   session = s;
   s.addEventListener('end', onSessionEnded);
+  const desc = list => Array.from(list).map(i => `${i.handedness}:${i.profiles[0]}`).join(', ') || '-';
+  s.addEventListener('inputsourceschange', e => xrlog('inputs +[' + desc(e.added) + '] -[' + desc(e.removed) + ']'));
+  s.addEventListener('visibilitychange', () => xrlog('XR visibility:', s.visibilityState));
+  ['selectstart', 'squeezestart'].forEach(k => s.addEventListener(k, e => xrlog(k, e.inputSource.handedness, e.inputSource.profiles[0])));
+  xrlog('session started', xrMode);
   try {
     if (!gl) gl = document.createElement('canvas').getContext('webgl', { xrCompatible: true });
     if (!gl) throw new Error('WebGL is not available');
@@ -230,6 +250,7 @@ function setFrameRate(s) {
 }
 
 function onSessionEnded() {
+  xrlog('SESSION END');
   session = null; refSpace = null; sources = {};
   clutch.left = clutch.right = false;
   fps = 0;
@@ -286,8 +307,10 @@ function onXRFrame(t, frame) {
     const seen = {};
     for (let k = 0; k < s.inputSources.length; k++) {
       const src = s.inputSources[k];
-      // controllers only: a tracked bare hand (src.hand) must never drive an arm
-      if (src.hand || !src.gamepad || (src.handedness !== 'left' && src.handedness !== 'right')) continue;
+      // controllers only: a tracked bare hand must never drive an arm. Quest reports hands as 'meta-fixed-hand'
+      // sources WITH a gamepad (pinch = trigger) but no thumbstick axes, and src.hand stays null unless the
+      // hand-tracking feature was requested, so check the profile and the axes too
+      if (!isController(src)) continue;
       seen[src.handedness] = src;
       hands[src.handedness] = readHand(frame, src);
     }

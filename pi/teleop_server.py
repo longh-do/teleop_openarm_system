@@ -31,6 +31,10 @@ M0 = np.array([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 SQ_ON, SQ_OFF = 0.7, 0.3
 FINE = 0.3
 XR_TIMEOUT = 0.15  # s without controller data -> disengage
+# a comfortable pose to start driving from (model degrees): forearm forward, elbow 90. Hanging straight down the arm
+# is singular (it can't move straight up), so S5+ start here. Left J1 and J5 are mirrored.
+READY_MODEL_DEG = {"right": [20, 0, 0, 90, 90, 0, 0], "left": [-20, 0, 0, 90, -90, 0, 0]}
+READY_SPEED = 0.3  # rad/s, fastest joint during the ready move
 GRIP_RATE = 3.0  # rad/s
 
 
@@ -103,6 +107,24 @@ class ArmBrain:
         self.last_buzz = None
         self.limit_buzz_t = 0.0
         self.ik_ms, self.ik_res = [], []
+        self.traj = None  # (q_from, q_to, t0, duration): a joint-space move the brain plays (ready pose)
+
+    def start_ready(self, now):
+        if not self.on or self.q_cmd is None:
+            return False
+        q_to = kin.to_motor(self.calib, np.radians(READY_MODEL_DEG[self.name]))
+        dur = max(4.0, float(np.max(np.abs(q_to - self.q_cmd))) / READY_SPEED)
+        self.engaged, self.traj = False, (self.q_cmd.copy(), q_to, now, dur)
+        return True
+
+    def play_traj(self, now):
+        if self.traj is None:
+            return
+        qa, qb, t0, dur = self.traj
+        u = min(1.0, (now - t0) / dur)
+        self.q_cmd = qa + (qb - qa) * (1 - math.cos(math.pi * u)) / 2
+        if u >= 1.0:
+            self.traj = None
 
     def on_tel(self, t, now):
         """New telemetry. If the loop reset its follower (epoch changed), re-sync and drop the clutch."""
@@ -110,6 +132,7 @@ class ArmBrain:
         self.tel, self.tel_t = t, now
         if t["epoch"] != self.epoch:
             self.epoch = t["epoch"]
+            self.traj = None
             self.q_cmd = np.array(t["x"][:7])
             self.g_cmd = t["x"][7]
             was = self.engaged
@@ -128,6 +151,7 @@ class ArmBrain:
         return self.tel is not None and self.tel["mode"] == "on" and time.monotonic() - self.tel_t < 0.3
 
     def engage(self, Cp, Cq, now):
+        self.traj = None
         x = np.array(self.tel["x"][:7])
         self.q_cmd = x
         E0p, E0R = kin.fk(self.name, self.calib, x)
@@ -214,15 +238,22 @@ class Brain:
             pass
 
     def send_targets(self):
+        now = time.monotonic()
         for a in self.arms.values():
+            if not a.engaged:
+                a.play_traj(now)
             if a.on and a.q_cmd is not None and a.epoch is not None:
                 self.to_loop({"t": "target", "arm": a.name, "epoch": a.epoch,
                               "q": [round(float(v), 5) for v in a.q_cmd],
                               "g": None if a.g_cmd is None else round(float(a.g_cmd), 5)})
         self.last_send = time.monotonic()
 
-    async def haptic(self, hand, i, ms):
-        await self.broadcast({"t": "haptic", "hand": hand, "i": i, "ms": ms})
+    PATTERNS = {"fine": [[0.5, 40, 90], [0.5, 40, 0]], "align": [[0.8, 350, 0]],
+                "stop": [[1.0, 150, 100], [1.0, 150, 100], [1.0, 150, 0]], "fault": [[1.0, 400, 0]],
+                "resync": [[0.8, 120, 80], [0.8, 120, 0]], "lost": [[1.0, 80, 60], [1.0, 80, 0]], "limit": [[0.3, 25, 0]]}
+
+    async def haptic(self, hand, kind):
+        await self.broadcast({"t": "haptic", "hand": hand, "pattern": self.PATTERNS[kind]})
 
     async def broadcast(self, msg):
         data = json.dumps(msg)
@@ -240,6 +271,9 @@ class Brain:
         self.last_xr, self.last_ts = now, ts
         self.xr_times.append(now)
         self.page_fps = m.get("fps", 0)
+        if now - getattr(self, "sample_t", 0.0) > 1.0:  # one raw sample a second, for debugging the headset side
+            self.sample_t = now
+            self.event("xr_sample", hands=m.get("hands"))
         for hand, a in self.arms.items():
             H = (m.get("hands") or {}).get(hand)
             if not H:
@@ -260,12 +294,13 @@ class Brain:
                 if e:
                     sn["presses"][i] += 1
                     self.event("button", hand=hand, button=["A/X", "B/Y", "stick"][i])
+                    print(time.strftime("%H:%M:%S"), f"button {hand} {['A/X', 'B/Y', 'stick'][i]}", flush=True)
             if edge[0]:  # A / X: fine mode (re-anchor so the scale change can't jump)
                 a.fine = not a.fine
                 self.say(f"{hand}: fine mode {'on' if a.fine else 'off'}")
                 if a.engaged and H.get("ok"):
                     a.engage(H["p"], H["q"], now)
-                await self.haptic(hand, 0.3, 40)
+                await self.haptic(hand, "fine")
             if edge[1] and hand == "right" and H.get("aim"):  # B: align
                 ax, _, az = H["aim"]
                 if math.hypot(ax, az) > 0.3:
@@ -276,9 +311,12 @@ class Brain:
                         o.engaged = False
                     self.say(f"aligned: robot forward = controller direction (yaw {math.degrees(self.yaw):+.0f} deg)")
                     self.event("align", yaw=self.yaw)
-                    await self.haptic("right", 0.8, 200)
+                    await self.haptic("right", "align")
             if edge[1] and hand == "left":  # Y: STOP
                 await self.stop("Y button")
+            if edge[2] and not a.engaged and a.start_ready(now):  # thumbstick click: go to the ready pose
+                self.say(f"{hand}: moving to the ready pose")
+                await self.haptic(hand, "align")
             sq = H.get("sq", 0.0)
             was = a.clutch
             a.clutch = sq > SQ_OFF if was else sq > SQ_ON
@@ -289,7 +327,7 @@ class Brain:
                     self.event("release", arm=hand, why="tracking lost" if not ok else "squeeze released")
                     if not ok:
                         self.say(f"{hand}: tracking lost, holding")
-                        await self.haptic(hand, 1.0, 120)
+                        await self.haptic(hand, "lost")
                 a.want_resume = False
             elif not a.engaged and a.tel is not None:
                 if a.tel["mode"] == "hold" and not a.want_resume and not was:
@@ -306,7 +344,7 @@ class Brain:
             if a.engaged:
                 if a.drive(H["p"], H["q"], self.M, dt) == "limit" and now - a.limit_buzz_t > 0.5:
                     a.limit_buzz_t = now
-                    await self.haptic(hand, 0.4, 30)
+                    await self.haptic(hand, "limit")
             if a.engaged:  # trigger drives the gripper only while that arm is held; release freezes it
                 a.grip(H.get("tr", 0.0), dt)
         self.send_targets()
@@ -316,8 +354,8 @@ class Brain:
             a.engaged = False
         self.to_loop({"t": "cmd", "cmd": "stop", "arm": "all"})
         self.say(f"STOP ({why}): parking, then power off")
-        await self.broadcast({"t": "haptic", "hand": "left", "i": 1.0, "ms": 300})
-        await self.broadcast({"t": "haptic", "hand": "right", "i": 1.0, "ms": 300})
+        await self.haptic("left", "stop")
+        await self.haptic("right", "stop")
 
     async def on_cmd(self, m):
         cmd = m.get("cmd")
@@ -326,6 +364,11 @@ class Brain:
         elif cmd == "power_on":
             self.to_loop({"t": "cmd", "cmd": "power_on", "arm": "all"})
             self.say("power on requested")
+        elif cmd == "ready":
+            now = time.monotonic()
+            names = [m.get("arm")] if m.get("arm") in self.arms else list(self.arms)
+            moved = [n for n in names if self.arms[n].start_ready(now)]
+            self.say(f"moving to the ready pose: {moved or 'no arm is on'}")
 
     def status(self):
         now = time.monotonic()
@@ -354,10 +397,10 @@ class Brain:
                         r = brain.arms[name].on_tel(t, now)
                         if r == "buzz":
                             brain.say(f"{name}: {t['reason']}")
-                            asyncio.ensure_future(brain.haptic(name, 1.0, 250))
+                            asyncio.ensure_future(brain.haptic(name, "fault"))
                         elif r == "resync":
                             brain.say(f"{name}: arm reset ({t['reason']}), squeeze again to drive")
-                            asyncio.ensure_future(brain.haptic(name, 0.8, 150))
+                            asyncio.ensure_future(brain.haptic(name, "resync"))
 
         await loop.create_datagram_endpoint(Proto, local_addr=("127.0.0.1", self.args.tel_port))
 
@@ -365,17 +408,18 @@ class Brain:
         """Keep-alive targets when the headset is quiet, status to pages, stats once a second."""
         n, stat_t = 0, time.monotonic()
         while True:
-            await asyncio.sleep(0.04)
+            await asyncio.sleep(0.01)
             now = time.monotonic()
             if now - self.last_xr > XR_TIMEOUT:
                 for a in self.arms.values():
                     if a.engaged:
                         a.engaged = False
                         self.say(f"{a.name}: no headset data, holding")
-            if now - self.last_send > 0.035:
+            busy = any(a.traj is not None for a in self.arms.values())
+            if now - self.last_send > (0.008 if busy else 0.035):
                 self.send_targets()
             n += 1
-            if n % 5 == 0:
+            if n % 20 == 0:
                 await self.broadcast(self.status())
             if now - stat_t >= 1.0:
                 self.stats(now - stat_t)
@@ -439,6 +483,13 @@ async def status_json(request):
     return web.json_response(request.app["brain"].status())
 
 
+async def cmd_http(request):
+    """POST /cmd {"cmd": "ready"|"stop"|"power_on", "arm": ...}: the same commands as the page, from a laptop."""
+    m = await request.json()
+    await request.app["brain"].on_cmd(m)
+    return web.json_response(request.app["brain"].status())
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8443)
@@ -465,6 +516,7 @@ def main():
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/status", status_json)
+    app.router.add_post("/cmd", cmd_http)
 
     async def start_bg(app):
         await brain.tel_reader()
