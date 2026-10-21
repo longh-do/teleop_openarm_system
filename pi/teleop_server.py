@@ -571,7 +571,9 @@ def main():
     ap.add_argument("--wmax", type=float, default=1.5, help="end-effector rotation cap rad/s")
     ap.add_argument("--jump", type=float, default=0.05, help="max target step per sample, m")
     ap.add_argument("--min-cutoff", type=float, default=2.0)
-    ap.add_argument("--beta", type=float, default=0.04)
+    # beta multiplies the hand speed in m/s: 0.04 (Enactic's value) made the filter a fixed ~2 Hz low-pass with
+    # ~80 ms delay at every speed; 20 keeps the same still-hand steadiness with 11-22 ms delay (measured on the Pi)
+    ap.add_argument("--beta", type=float, default=20.0)
     ap.add_argument("--d-cutoff", type=float, default=1.5)
     ap.add_argument("--rot-cutoff", type=float, default=4.0, help="Hz, orientation SLERP smoothing")
     ap.add_argument("--ik", choices=["position", "pose"], default="position",
