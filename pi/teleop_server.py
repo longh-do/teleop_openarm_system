@@ -237,6 +237,9 @@ class Brain:
         self.xr_times, self.page_skips, self.page_fps = [], 0, 0.0
         self.src_ts = []
         self.prev_buttons = {}
+        # the page says when an AR session starts/ends: WebXR's 'local' space is re-centred each session, so the
+        # alignment (B) is asked for again. Pages that never say so keep the saved alignment.
+        self.xr_active, self.aligned, self.xr_ws = False, True, None
         self.seen = {h: {"frames": 0, "ok": 0, "sq_max": 0.0, "tr_max": 0.0, "presses": [0, 0, 0]} for h in ("left", "right")}
         self.msg = ""
         os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
@@ -334,6 +337,7 @@ class Brain:
                         json.dump({"yaw": self.yaw}, f)
                     for o in self.arms.values():
                         o.engaged = False
+                    self.aligned = True
                     self.say(f"aligned: robot forward = controller direction (yaw {math.degrees(self.yaw):+.0f} deg)")
                     self.event("align", yaw=self.yaw)
                     await self.haptic("right", "align")
@@ -356,9 +360,9 @@ class Brain:
             if getattr(a, "ready_after_resume", False) and a.on:
                 a.ready_after_resume = False
                 if a.start_ready(now):
-                    self.say(f"{hand}: moving to the ready pose")
+                    self.say(f"{hand}: moving to the home pose")
             elif edge[2] and not a.engaged and a.start_ready(now):  # thumbstick click: go to the ready pose
-                self.say(f"{hand}: moving to the ready pose")
+                self.say(f"{hand}: moving to the home pose")
                 await self.haptic(hand, "align")
             sq = H.get("sq", 0.0)
             was = a.clutch
@@ -386,6 +390,10 @@ class Brain:
                         a.resume_t = now
                         self.to_loop({"t": "cmd", "cmd": "resume", "arm": hand})
                         a.want_resume = True
+                elif a.on and not self.aligned:
+                    if not was:
+                        self.say(f"{hand}: press B to align first")
+                        await self.haptic(hand, "lost")
                 elif a.on and not was or (a.on and a.want_resume):
                     if self.unverified and hand in self.unverified and not self.args.allow_unverified:
                         if not was:
@@ -421,6 +429,16 @@ class Brain:
         elif cmd == "power_on":
             self.to_loop({"t": "cmd", "cmd": "power_on", "arm": "all"})
             self.say("power on requested")
+        elif cmd == "xr_start":
+            self.xr_active, self.aligned = True, False
+            for a in self.arms.values():
+                a.engaged = False
+            self.say("AR started: press B to align")
+        elif cmd == "xr_end":
+            self.xr_active = False
+            for a in self.arms.values():
+                a.engaged = False
+            self.say("AR ended: arms hold")
         elif cmd == "ready":
             now = time.monotonic()
             names = [m.get("arm")] if m.get("arm") in self.arms else list(self.arms)
@@ -436,7 +454,65 @@ class Brain:
             mode = "no motor loop" if t is None or now - a.tel_t > 0.5 else t["mode"]
             mode = {"starting_read": "starting", "preload": "starting", "enabling": "starting", "starting_hold": "starting"}.get(mode, mode)
             arms[n] = {"mode": mode, "clutch": a.engaged, "fine": a.fine, "msg": (t or {}).get("reason", "")}
-        return {"t": "status", "arms": arms, "pose_hz": len(recent), "msg": self.msg}
+        return {"t": "status", "arms": arms, "pose_hz": len(recent), "msg": self.msg, "hud": self.hud(arms)}
+
+    @staticmethod
+    def plain(reason):
+        """The motor loop's reason, said simply for the headset panel."""
+        r = reason or ""
+        if "tracking error" in r:
+            return "A joint fell behind (moved too fast, or bumped something)."
+        if "torque" in r:
+            return "A joint is pushing against something."
+        if "silent" in r or "not answering" in r:
+            return f"Motor {r.split()[0]} stopped answering."
+        if "refused target" in r:
+            return "That move was too sudden."
+        if "hot" in r:
+            return "A motor is hot: let it cool for a minute."
+        if "bus not acknowledging" in r:
+            return "The arm lost power or its cable."
+        return r[:60]
+
+    def hud(self, arms):
+        """Headline, up to 3 detail lines, and a label per arm, for the guide panel inside the headset."""
+        label = {}
+        for n, st in arms.items():
+            a, m = self.arms[n], st["mode"]
+            if m == "no motor loop":
+                label[n] = "NOT USED"
+            elif m == "off":
+                label[n] = "OFF"
+            elif m == "starting" or (m == "on" and a.traj is not None):
+                label[n] = "STARTING"
+            elif m == "on":
+                label[n] = ("DRIVING" if a.engaged else "READY") if not a.fine else "FINE"
+            else:
+                label[n] = {"hold": "PAUSED", "fault": "FAULT", "parking": "STOPPING"}.get(m, m.upper())
+        used = [n for n in arms if label[n] != "NOT USED"]
+        name = lambda ns: " and ".join(n.upper() for n in ns)  # noqa: E731
+        def out(headline, detail, level):
+            return {"headline": headline, "detail": detail, "level": level, "left": label["left"], "right": label["right"]}
+        if not used:
+            return out("Robot program not running", ["On the laptop, run: pi/start.sh"], "error")
+        if faults := [n for n in used if arms[n]["mode"] == "fault"]:
+            return out(f"{name(faults)} arm fault", [self.plain(arms[faults[0]]["msg"]), "Press Y to stop both arms."], "error")
+        if [n for n in used if arms[n]["mode"] == "parking"]:
+            return out("Stopping...", ["The arms lower and switch off.", "When they are OFF, hold the RIGHT thumbstick 1 s to start again."], "warn")
+        if all(arms[n]["mode"] == "off" for n in used):
+            return out("Arms are OFF", ["Stand clear of the arms.", "Hold the RIGHT thumbstick down for 1 second to switch them on."], "info")
+        if [n for n in used if label[n] == "STARTING"]:
+            return out("Arms starting...", ["They rise to point forward. Stand clear."], "warn")
+        if held := [n for n in used if arms[n]["mode"] == "hold"]:
+            return out(f"{name(held)} arm paused", [self.plain(arms[held[0]]["msg"]),
+                                                     "Squeeze again to continue, or click its thumbstick to go home."], "warn")
+        if self.xr_active and not self.aligned:
+            return out("Press B to align", ["Stand beside the robot, facing the way it faces.",
+                                            "Point the RIGHT controller straight ahead, then press B."], "info")
+        if driving := [n for n in used if self.arms[n].engaged]:
+            return out(f"Driving {name(driving)}", ["Release the grip to freeze the arm.", "Trigger closes the gripper. Y = STOP."], "ok")
+        return out("Ready to drive", ["Hold a GRIP to move that arm. Trigger = gripper.",
+                                      "A/X fine mode - thumbstick = home pose - Y = STOP"], "ok")
 
     async def tel_reader(self):
         loop = asyncio.get_running_loop()
@@ -481,7 +557,7 @@ class Brain:
             if now - self.last_send > (0.008 if busy else 0.035):
                 self.send_targets()
             n += 1
-            if n % 20 == 0:
+            if n % 10 == 0:  # ~10 Hz: drives the headset's guide panel
                 await self.broadcast(self.status())
             if now - stat_t >= 1.0:
                 self.stats(now - stat_t)
@@ -535,9 +611,15 @@ async def ws_handler(request):
                 brain.last_remote = request.remote
                 await brain.on_xr(m)
             elif m.get("t") == "cmd":
+                if m.get("cmd") == "xr_start":
+                    brain.xr_ws = ws
                 await brain.on_cmd(m)
     finally:
         brain.ws.discard(ws)
+        if brain.xr_ws is ws:  # the AR page went away without saying 'xr_end'
+            brain.xr_ws, brain.xr_active = None, False
+            for a in brain.arms.values():
+                a.engaged = False
         brain.say(f"page disconnected ({request.remote})")
     return ws
 

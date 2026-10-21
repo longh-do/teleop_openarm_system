@@ -15,14 +15,20 @@
   button { font: inherit; font-weight: 700; color: #fff; border: 0; border-radius: 12px;
            min-height: 64px; padding: 12px 18px; cursor: pointer; touch-action: manipulation; }
   button:disabled { opacity: .45; cursor: not-allowed; }
+  #start { display: block; width: 100%; min-height: 200px; font-size: 80px; letter-spacing: 10px;
+           background: #1f6feb; box-shadow: inset 0 0 0 5px #79b8ff; }
+  .lead { margin: 10px 0; font-size: 20px; text-align: center; }
   #stop { display: block; width: 100%; min-height: 140px; font-size: 52px; letter-spacing: 6px;
           background: #d0021b; box-shadow: inset 0 0 0 5px #ff6b7d; }
   #stop:active { background: #8f0012; }
-  .row { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0; }
-  .row button { flex: 1 1 160px; font-size: 22px; }
-  #enter { background: #1f6feb; }
-  #power { background: #2d7a46; }
+  #power { display: block; width: 100%; margin-top: 10px; font-size: 22px; background: #2d7a46; }
   .card { background: #151a21; border: 1px solid #2a323d; border-radius: 12px; padding: 12px; margin: 12px 0; }
+  #hudHead { font-size: 26px; font-weight: 800; }
+  #hudDetail { white-space: pre-line; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .chip { padding: 4px 14px; border-radius: 999px; font-weight: 800; }
+  .legend { margin: 0; padding-left: 22px; }
+  .helper { margin-top: 24px; padding-top: 12px; border-top: 2px solid #2a323d; }
   .grid { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; }
   .k { color: #9aa5b1; }
   .arms { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -33,57 +39,75 @@
   .m-starting, .m-parking { background: #b7791f; } .m-off { background: #4a5260; }
   .ok { color: #3fb950; } .bad { color: #ff6b6b; } .warn { color: #f2cc60; }
   .msg { word-break: break-word; }
-  .help { color: #c9d1d9; }
 </style>
 </head>
 <body>
 <h1>OpenArm Quest Teleop</h1>
 
-<button id="stop" type="button">STOP</button>
-<div class="row">
-  <button id="enter" type="button" disabled>Enter AR</button>
-  <button id="power" type="button">Power on</button>
-</div>
+<button id="start" type="button" disabled>START</button>
+<p class="lead">Put the headset on, tap START, then follow the text you see in the headset.</p>
 <div id="note" class="card warn" hidden></div>
-<pre id="xrLog" class="card" style="white-space:pre-wrap;font-size:12px;max-height:30vh;overflow:auto;margin:8px 0"></pre>
 
-<div class="card grid">
-  <span class="k">WebSocket</span><span id="wsState">-</span>
-  <span class="k">XR</span><span id="xrState">checking…</span>
-  <span class="k">XR fps</span><span id="fps">-</span>
-  <span class="k">Sent / s</span><span id="sendRate">0</span>
-  <span class="k">Skipped frames</span><span id="skipped">0</span>
-  <span class="k">Server status</span><span id="statusAge">no status yet</span>
-  <span class="k">Server pose Hz</span><span id="poseHz">-</span>
-  <span class="k">Server msg</span><span id="srvMsg" class="msg">-</span>
-  <span class="k">Last command</span><span id="cmdState">-</span>
+<!-- the same guide text the headset shows -->
+<div class="card">
+  <div id="hudHead"></div>
+  <div id="hudDetail"></div>
+  <div class="chips"><span id="chip-left" class="chip"></span><span id="chip-right" class="chip"></span></div>
 </div>
 
-<div class="arms">
-  <div class="card">
-    <h2>Left arm</h2>
-    <span id="left-mode" class="mode">?</span>
-    <div class="grid">
-      <span class="k">Clutch</span><span id="left-clutch">-</span>
-      <span class="k">Fine</span><span id="left-fine">-</span>
-    </div>
-    <div id="left-msg" class="msg"></div>
-  </div>
-  <div class="card">
-    <h2>Right arm</h2>
-    <span id="right-mode" class="mode">?</span>
-    <div class="grid">
-      <span class="k">Clutch</span><span id="right-clutch">-</span>
-      <span class="k">Fine</span><span id="right-fine">-</span>
-    </div>
-    <div id="right-msg" class="msg"></div>
-  </div>
+<div class="card">
+  <h2>Controls in the headset</h2>
+  <ul class="legend">
+    <li><b>Hold GRIP</b> = drive that arm (release = freeze)</li>
+    <li><b>TRIGGER</b> (while holding grip) = close gripper</li>
+    <li><b>B</b> = align (stand beside the robot facing its way, point right controller straight ahead)</li>
+    <li><b>A / X</b> = fine mode</li>
+    <li><b>Thumbstick click</b> = home pose</li>
+    <li><b>Hold RIGHT thumbstick 1 s</b> = switch arms on</li>
+    <li><b>Y</b> = STOP (arms lower and switch off)</li>
+  </ul>
 </div>
 
-<p class="card help">Start: Power on (here) → Enter AR → the arms rise to the ready pose by themselves → B to align.
-Squeeze = move arm (hold). Trigger = gripper. A / X = fine mode.
-B = align: stand beside the robot facing the way it faces, point the right controller straight ahead, press B.
-Y = STOP (park and power off). Arms off? Hold a thumbstick 1 s to power on again. Thumbstick click = ready pose.</p>
+<section class="helper">
+  <h2>Laptop controls (for a helper)</h2>
+  <button id="stop" type="button">STOP</button>
+  <button id="power" type="button">Power on</button>
+
+  <div class="card grid">
+    <span class="k">WebSocket</span><span id="wsState">-</span>
+    <span class="k">XR</span><span id="xrState">checking…</span>
+    <span class="k">XR fps</span><span id="fps">-</span>
+    <span class="k">Sent / s</span><span id="sendRate">0</span>
+    <span class="k">Skipped frames</span><span id="skipped">0</span>
+    <span class="k">Server status</span><span id="statusAge">no status yet</span>
+    <span class="k">Server pose Hz</span><span id="poseHz">-</span>
+    <span class="k">Server msg</span><span id="srvMsg" class="msg">-</span>
+    <span class="k">Last command</span><span id="cmdState">-</span>
+  </div>
+
+  <div class="arms">
+    <div class="card">
+      <h2>Left arm</h2>
+      <span id="left-mode" class="mode">?</span>
+      <div class="grid">
+        <span class="k">Clutch</span><span id="left-clutch">-</span>
+        <span class="k">Fine</span><span id="left-fine">-</span>
+      </div>
+      <div id="left-msg" class="msg"></div>
+    </div>
+    <div class="card">
+      <h2>Right arm</h2>
+      <span id="right-mode" class="mode">?</span>
+      <div class="grid">
+        <span class="k">Clutch</span><span id="right-clutch">-</span>
+        <span class="k">Fine</span><span id="right-fine">-</span>
+      </div>
+      <div id="right-msg" class="msg"></div>
+    </div>
+  </div>
+
+  <pre id="xrLog" class="card" style="white-space:pre-wrap;font-size:12px;max-height:30vh;overflow:auto;margin:8px 0"></pre>
+</section>
 
 <script>
 'use strict';
@@ -107,10 +131,11 @@ function connect() {
     return;
   }
   ws = sock;
-  sock.onopen = () => setText('wsState', 'connected', 'ok');
+  sock.onopen = () => { setText('wsState', 'connected', 'ok'); sendXrStart(); updateHud(); };
   sock.onclose = () => {
     if (ws === sock) ws = null;
     setText('wsState', 'disconnected, retrying…', 'bad');
+    updateHud();
     setTimeout(connect, 1000);
   };
   sock.onmessage = ev => {
@@ -145,6 +170,52 @@ function renderStatus(m) {
   }
   $('poseHz').textContent = typeof m.pose_hz === 'number' ? m.pose_hz.toFixed(1) : '-';
   $('srvMsg').textContent = m.msg || '-';
+  serverHud = normHud(m.hud);
+  // By now the server has seen the squeeze (200 ms covers a status already on its way), so its chip label wins.
+  for (const h of HANDS) if (lastStatusAt - localDriveAt[h] > 200) localDriveAt[h] = 0;
+  updateHud();
+}
+
+// ---------------- Guide text: the server's 'hud' plus local state, for the headset panel and this page ----------------
+const LEVEL_RGB = { info: '#ffffff', ok: '#4ade80', warn: '#fbbf24', error: '#ff5c5c' };
+const CHIP_KIND = { DRIVING: 'go', READY: 'go', FINE: 'go', PAUSED: 'wait', STARTING: 'wait', STOPPING: 'wait', FAULT: 'fault' };
+const CHIP_RGB = { go: '#1f9d44', wait: '#c27c0e', fault: '#d0021b', off: '#5a6270' };   // off: OFF and anything unknown
+const chipRGB = label => CHIP_RGB[CHIP_KIND[label] || 'off'];
+const NO_DRIVE = ['OFF', 'STARTING', 'STOPPING', 'FAULT'];   // a squeeze can't drive these: no instant DRIVING chip
+let serverHud = null;                                        // last status.hud, cleaned up (null if missing)
+const localDriveAt = { left: 0, right: 0 };                  // when the local clutch engaged (ms); 0 = no override
+let hudNow = null, hudKey = '', hudDirty = true;             // current guide text; dirty = headset texture is stale
+
+function normHud(h) {
+  if (!h || typeof h !== 'object') return null;
+  const label = v => String(v ?? '?').toUpperCase();
+  return { headline: String(h.headline ?? ''), detail: [].concat(h.detail ?? []).slice(0, 3).map(String),
+           level: Object.hasOwn(LEVEL_RGB, h.level) ? h.level : 'info', left: label(h.left), right: label(h.right) };
+}
+
+function currentHud() {
+  if (!wsOpen()) return { headline: 'No connection to the robot', level: 'error', left: '?', right: '?',
+                          detail: ['Driving is paused until the link is back.', 'Trying again every second…'] };
+  const fresh = lastStatusAt && performance.now() - lastStatusAt < 2000;
+  if (!fresh || !serverHud) return { headline: 'Waiting for the robot…', level: 'warn', left: '?', right: '?',
+                                     detail: ['If this stays, check that the robot program is running.'] };
+  const h = { ...serverHud };
+  for (const hand of HANDS) if (localDriveAt[hand] && !NO_DRIVE.includes(h[hand])) h[hand] = 'DRIVING';
+  return h;
+}
+
+// Recompute; on a change update this page and mark the headset texture for a redraw.
+function updateHud() {
+  const h = currentHud(), key = JSON.stringify(h);
+  if (key === hudKey) return;
+  hudKey = key; hudNow = h; hudDirty = true;
+  $('hudHead').textContent = h.headline;
+  $('hudHead').style.color = LEVEL_RGB[h.level];
+  $('hudDetail').textContent = h.detail.join('\n');
+  for (const hand of HANDS) {
+    $('chip-' + hand).textContent = `${hand.toUpperCase()}: ${h[hand]}`;
+    $('chip-' + hand).style.background = chipRGB(h[hand]);
+  }
 }
 
 // ---------------- Haptics ----------------
@@ -170,6 +241,7 @@ let xrMode = null, session = null, refSpace = null, gl = null, targetRate = null
 const clutch = { left: false, right: false };    // local Schmitt-trigger clutch (feedback only)
 let seq = 0, skipped = 0, sentCount = 0;
 let fps = 0, fpsFrames = 0, fpsT0 = 0;
+let xrStartSent = false;                         // has the server been told about this AR session?
 
 async function initXR() {
   if (!navigator.xr) {
@@ -183,19 +255,19 @@ async function initXR() {
     if (await navigator.xr.isSessionSupported('immersive-ar')) xrMode = 'immersive-ar';
     else if (await navigator.xr.isSessionSupported('immersive-vr')) xrMode = 'immersive-vr';
   } catch (e) { console.warn('isSessionSupported failed', e); }
-  if (xrMode) { setText('xrState', `ready (${xrMode})`); $('enter').disabled = false; }
+  if (xrMode) { setText('xrState', `ready (${xrMode})`); $('start').disabled = false; }
   else { setText('xrState', 'no immersive mode', 'bad'); showNote('No immersive WebXR session is supported here. Control panel only.'); }
 }
 
-$('enter').addEventListener('click', () => {
+$('start').addEventListener('click', () => {
   if (!xrMode || session) return;
-  $('enter').disabled = true;
+  $('start').disabled = true;
   setText('xrState', 'starting…', 'warn');
   // requestSession is called directly in the click handler (needs the user gesture).
   navigator.xr.requestSession(xrMode).then(onSessionStarted).catch(err => {
     setText('xrState', 'failed to start', 'bad');
     showNote('XR start failed: ' + ((err && err.message) || err));
-    $('enter').disabled = !!session;
+    $('start').disabled = !!session;
   });
 });
 
@@ -210,6 +282,7 @@ function xrlog(...a) {   // also readable from the laptop over adb + devtools (t
 
 async function onSessionStarted(s) {
   session = s;
+  xrStartSent = false;
   s.addEventListener('end', onSessionEnded);
   const desc = list => Array.from(list).map(i => `${i.handedness}:${i.profiles[0]}`).join(', ') || '-';
   s.addEventListener('inputsourceschange', e => xrlog('inputs +[' + desc(e.added) + '] -[' + desc(e.removed) + ']'));
@@ -226,11 +299,20 @@ async function onSessionStarted(s) {
     s.end().catch(() => {});
     throw e;
   }
+  sendXrStart();          // the server asks for a fresh alignment in each AR session
+  hudSetup();             // a failure here only loses the guide panel, never the session
+  hudPose.fresh = true;   // the panel starts straight in front of the eyes
+  hudDrawn = false;
   setFrameRate(s);
   fps = 0; fpsFrames = 0; fpsT0 = 0;
   $('note').hidden = true;
   setText('xrState', `running (${xrMode})`, 'ok');
   s.requestAnimationFrame(onXRFrame);
+}
+
+// Once per AR session; if the socket is down when AR starts, as soon as it is back.
+function sendXrStart() {
+  if (session && refSpace && !xrStartSent && wsOpen()) { xrStartSent = true; sendCmd('xr_start'); }
 }
 
 // Ask for 90 Hz (Quest default is 72); otherwise the highest rate <= 120.
@@ -252,11 +334,14 @@ function setFrameRate(s) {
 
 function onSessionEnded() {
   xrlog('SESSION END');
+  if (wsOpen()) sendCmd('xr_end');
   session = null; refSpace = null; sources = {};
   clutch.left = clutch.right = false;
+  localDriveAt.left = localDriveAt.right = 0;
   fps = 0;
-  setText('xrState', 'session ended (tap Enter AR to restart)', 'warn');
-  $('enter').disabled = !xrMode;
+  setText('xrState', 'session ended (tap START to restart)', 'warn');
+  $('start').disabled = !xrMode;
+  updateHud();
 }
 
 function poseOut(tf) {
@@ -287,7 +372,7 @@ function onXRFrame(t, frame) {
   const s = frame.session;
   s.requestAnimationFrame(onXRFrame);
   try {
-    // Clear to transparent so passthrough shows; nothing else is drawn.
+    // Clear to transparent so passthrough shows; the guide panel is the only thing drawn on top.
     const layer = s.renderState.baseLayer;
     if (layer) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
@@ -317,12 +402,12 @@ function onXRFrame(t, frame) {
     }
     sources = seen;
 
-    // Local clutch (engage > 0.7, release < 0.3) with a haptic tick on each change.
+    // Local clutch (engage > 0.7, release < 0.3) with a haptic tick on each change; the chip says DRIVING at once.
     for (const h of HANDS) {
       const H = hands[h];
       if (!H) continue;
-      if (!clutch[h] && H.sq > 0.7) { clutch[h] = true; pulse(h, 0.6, 60); }
-      else if (clutch[h] && H.sq < 0.3) { clutch[h] = false; pulse(h, 0.6, 60); }
+      if (!clutch[h] && H.sq > 0.7) { clutch[h] = true; pulse(h, 0.6, 60); localDriveAt[h] = performance.now(); updateHud(); }
+      else if (clutch[h] && H.sq < 0.3) { clutch[h] = false; pulse(h, 0.6, 60); localDriveAt[h] = 0; updateHud(); }
     }
 
     // One message per frame; newest wins, so skip while the socket still has unsent data.
@@ -334,10 +419,149 @@ function onXRFrame(t, frame) {
         sentCount++;
       }
     }
+
+    if (layer && vp) hudDraw(layer, vp);
   } catch (e) {
     console.error(e);
     showNote('XR frame error: ' + e.message);
   }
+}
+
+// ---------------- Guide panel in the headset: text on a 2D canvas -> texture -> one quad per eye ----------------
+const HUD_W = 1024, HUD_H = 512;                       // canvas pixels
+const HUD_SIZE = [0.55, 0.275], HUD_DIST = 1.0, HUD_DROP = 0.30, HUD_FOLLOW = 0.1;   // metres; easing per frame
+const HUD_TILT = Math.atan2(HUD_DROP, HUD_DIST);      // lean back so the panel faces the eyes
+const HUD_FONT = 'system-ui, Roboto, sans-serif';
+const hudCanvas = document.createElement('canvas');
+hudCanvas.width = HUD_W; hudCanvas.height = HUD_H;
+const hudCtx = hudCanvas.getContext('2d');
+const hudPose = { yaw: 0, x: 0, y: 0, z: 0, fresh: true };   // smoothed head heading/position the panel hangs from
+const hudModel = new Float32Array(16);
+let hudGL = null;      // GL objects once set up; false = setup or drawing failed (the panel stays off)
+let hudDrawn = false;  // first draw of this session logged?
+
+const HUD_VS = `attribute vec2 aPos; attribute vec2 aUV; uniform mat4 uProj, uView, uModel; varying vec2 vUV;
+void main() { vUV = aUV; gl_Position = uProj * uView * uModel * vec4(aPos, 0.0, 1.0); }`;
+const HUD_FS = `precision mediump float; uniform sampler2D uTex; varying vec2 vUV;
+void main() { gl_FragColor = texture2D(uTex, vUV); }`;
+
+function wrapLines(c, paragraphs, maxW, maxLines) {   // greedy word wrap; '…' when it doesn't fit
+  const out = [];
+  for (const p of paragraphs) {
+    let line = '';
+    for (const word of p.split(/\s+/).filter(Boolean)) {
+      const next = line ? line + ' ' + word : word;
+      if (line && c.measureText(next).width > maxW) { out.push(line); line = word; } else line = next;
+    }
+    if (line) out.push(line);
+  }
+  if (out.length > maxLines) { out.length = maxLines; out[maxLines - 1] += ' …'; }
+  return out;
+}
+
+function paintHud(h) {
+  const c = hudCtx, P = 40, maxW = HUD_W - 2 * P;
+  const box = (x, y, w, hh, r, color) => { c.fillStyle = color; c.beginPath(); c.roundRect(x, y, w, hh, r); c.fill(); };
+  c.clearRect(0, 0, HUD_W, HUD_H);
+  box(4, 4, HUD_W - 8, HUD_H - 8, 40, 'rgba(0,0,0,0.6)');
+  c.textAlign = 'left'; c.textBaseline = 'top';
+  c.shadowColor = 'rgba(0,0,0,0.9)'; c.shadowBlur = 10;   // dark halo: readable over bright passthrough too
+  c.fillStyle = LEVEL_RGB[h.level]; c.font = `bold 64px ${HUD_FONT}`;
+  c.fillText(h.headline, P, P, maxW);                   // maxWidth squeezes a headline that is too long
+  c.fillStyle = '#e8edf2'; c.font = `40px ${HUD_FONT}`;
+  wrapLines(c, h.detail, maxW, 4).forEach((line, i) => c.fillText(line, P, 132 + i * 52, maxW));
+  const gap = 24, cw = (maxW - gap) / 2, ch = 80, cy = HUD_H - P - ch;   // the two arm chips along the bottom
+  c.shadowBlur = 0;
+  c.textAlign = 'center'; c.textBaseline = 'middle'; c.font = `bold 40px ${HUD_FONT}`;
+  HANDS.forEach((hand, i) => {
+    const x = P + i * (cw + gap);
+    box(x, cy, cw, ch, ch / 2, chipRGB(h[hand]));
+    c.fillStyle = '#ffffff';
+    c.fillText(`${hand.toUpperCase()}: ${h[hand]}`, x + cw / 2, cy + ch / 2 + 2, cw - 48);
+  });
+}
+
+function hudSetup() {   // once per WebGL context
+  if (hudGL !== null) return;
+  try {
+    const shader = (type, src) => {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+      return sh;
+    };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, shader(gl.VERTEX_SHADER, HUD_VS));
+    gl.attachShader(prog, shader(gl.FRAGMENT_SHADER, HUD_FS));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+    const w = HUD_SIZE[0] / 2, h = HUD_SIZE[1] / 2;
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    // triangle strip of x, y (metres, panel plane), u, v (v = 0 is the canvas's top row, so no flip needed)
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-w, -h, 0, 1, w, -h, 1, 1, -w, h, 0, 0, w, h, 1, 0]), gl.STATIC_DRAW);
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);   // text stays smooth when small
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    const u = name => gl.getUniformLocation(prog, name);
+    hudGL = { prog, buf, tex, aPos: gl.getAttribLocation(prog, 'aPos'), aUV: gl.getAttribLocation(prog, 'aUV'),
+              uProj: u('uProj'), uView: u('uView'), uModel: u('uModel') };
+    hudDirty = true;
+  } catch (e) { hudGL = false; xrlog('guide panel off:', e.message); }
+}
+
+// Lazy follow: ease the panel toward the head's position and heading (yaw only, pitch and roll ignored).
+function followHead(tf) {
+  const m = tf.matrix, p = tf.position, k = hudPose.fresh ? 1 : HUD_FOLLOW;
+  hudPose.fresh = false;
+  if (Math.hypot(m[8], m[10]) > 0.2) {                 // heading is undefined when looking straight up or down
+    const d = Math.atan2(m[8], m[10]) - hudPose.yaw;   // m[8..10] = head +Z (backwards); yaw 0 = facing -Z
+    hudPose.yaw += k * Math.atan2(Math.sin(d), Math.cos(d));   // the short way round
+  }
+  hudPose.x += k * (p.x - hudPose.x); hudPose.y += k * (p.y - hudPose.y); hudPose.z += k * (p.z - hudPose.z);
+  const s = Math.sin(hudPose.yaw), c = Math.cos(hudPose.yaw), st = Math.sin(HUD_TILT), ct = Math.cos(HUD_TILT);
+  // column-major: panel right, panel up (leaning back), panel normal (towards the eyes), centre
+  hudModel.set([c, 0, -s, 0, -s * st, ct, -c * st, 0, s * ct, st, c * ct, 0,
+                hudPose.x - s * HUD_DIST, hudPose.y - HUD_DROP, hudPose.z - c * HUD_DIST, 1]);
+}
+
+function hudDraw(layer, pose) {
+  if (!hudGL) return;
+  try {
+    if (hudDirty) {   // only when the text changed
+      hudDirty = false;
+      paintHud(hudNow);
+      gl.bindTexture(gl.TEXTURE_2D, hudGL.tex);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, hudCanvas);
+      gl.generateMipmap(gl.TEXTURE_2D);
+    }
+    followHead(pose.transform);
+    gl.useProgram(hudGL.prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, hudGL.buf);
+    gl.enableVertexAttribArray(hudGL.aPos);
+    gl.vertexAttribPointer(hudGL.aPos, 2, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(hudGL.aUV);
+    gl.vertexAttribPointer(hudGL.aUV, 2, gl.FLOAT, false, 16, 8);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, hudGL.tex);
+    gl.disable(gl.DEPTH_TEST);                         // always visible
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);      // premultiplied alpha
+    gl.uniformMatrix4fv(hudGL.uModel, false, hudModel);
+    for (const view of pose.views) {
+      const v = layer.getViewport(view);
+      gl.viewport(v.x, v.y, v.width, v.height);
+      gl.uniformMatrix4fv(hudGL.uProj, false, view.projectionMatrix);
+      gl.uniformMatrix4fv(hudGL.uView, false, view.transform.inverse.matrix);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+    if (!hudDrawn) { hudDrawn = true; const err = gl.getError(); xrlog('guide panel drawn', err ? 'GL error ' + err : 'ok'); }
+  } catch (e) { hudGL = false; xrlog('guide panel off:', e.message); }
 }
 
 // ---------------- Buttons, keyboard, 1 s UI refresh ----------------
@@ -364,9 +588,11 @@ setInterval(() => {
   if (age === null) setText('statusAge', 'no status yet', 'warn');
   else if (age < 2) setText('statusAge', 'live', 'ok');
   else setText('statusAge', `STALE (${age.toFixed(0)} s old)`, 'bad');
+  updateHud();   // a status older than 2 s counts as no status
 }, 1000);
 
 connect();
+updateHud();
 initXR();
 </script>
 </body>
