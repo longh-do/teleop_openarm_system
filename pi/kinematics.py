@@ -1,6 +1,6 @@
 """Forward/inverse kinematics for both OpenArm arms (numpy only).
 
-Geometry, axes, limits, TOOL and the posture idea come from Monty's retarget (~/backend/app/robots/openarm.py),
+Geometry, axes, limits, TOOL and the posture idea come from Monty's OpenArm retarget,
 itself transcribed from openarm_mujoco v2 openarm_bimanual.xml. Rig frame: x forward, y left, z up, arms
 hanging at model q = 0.
 
