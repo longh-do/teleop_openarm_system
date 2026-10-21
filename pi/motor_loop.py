@@ -577,7 +577,7 @@ def main():
             print(f"[{a.name}] leaving out J{', J'.join(map(str, sorted(a.skip)))} (dead motor): held at its rest angle in the model", flush=True)
             log.event("skip", arm=a.name, joints=sorted(a.skip))
         if calib[a.name]["verified"]:
-            # outer safety envelope: the model's limits + 10 deg (IK keeps to the limits - 5 deg; the hanging rest
+            # outer safety envelope: the model's limits + 10 deg (IK keeps to the limits - 2 deg; the hanging rest
             # pose sits right at the elbow's 0 and wanders a few degrees between power cycles)
             lim = kin.motor_limits(a.name, calib[a.name], margin=-math.radians(10))
             a.limits = [tuple(map(float, row)) for row in lim]

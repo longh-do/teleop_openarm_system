@@ -58,11 +58,10 @@
 <div class="card">
   <h2>Controls in the headset</h2>
   <ul class="legend">
-    <li><b>Hold GRIP</b> = drive that arm (release = freeze)</li>
-    <li><b>TRIGGER</b> (while holding grip) = close gripper</li>
+    <li><b>Hold GRIP</b> = drive that arm (release = freeze). The gripper copies where your hand is <b>and how it is turned</b>: hold the controller the way the gripper points</li>
+    <li><b>TRIGGER</b> (while holding grip) = close gripper. After you grab again, the gripper waits until the trigger reaches its current opening, so a held object stays held</li>
     <li><b>B</b> = align (stand beside the robot facing its way, point right controller straight ahead)</li>
-    <li><b>A / X</b> = fine mode</li>
-    <li><b>Thumbstick click</b> = home pose</li>
+    <li><b>A / X</b> = fine mode: moves and turns 3x smaller</li>
     <li><b>Hold RIGHT thumbstick 1 s</b> = switch arms on</li>
     <li><b>Y</b> = STOP (arms lower and switch off)</li>
   </ul>
@@ -569,7 +568,7 @@ const stop = () => sendCmd('stop');
 $('stop').addEventListener('pointerdown', stop);                      // fire on touch-down, no delay
 $('stop').addEventListener('click', e => { if (e.detail === 0) stop(); }); // keyboard activation
 $('power').addEventListener('click', () => {
-  if (confirm('Power on both arms? They will raise their forearms to point forward. Make sure the area around the arms is clear.')) sendCmd('power_on');
+  if (confirm('Power on both arms? They switch on and hold where they are. Make sure the area around the arms is clear.')) sendCmd('power_on');
 });
 document.addEventListener('keydown', e => {
   if (e.code === 'Space' || e.key === ' ' || e.key === 'Escape') { e.preventDefault(); stop(); }

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Pretend to be the Quest page: stream synthetic controller poses to teleop_server for a dry run.
   .venv/bin/python tools/fake_quest.py [--hand right] [--seconds 6]
-Squeezes after 1 s, moves the hand 6 cm forward (WebXR -z) and 4 cm up over 2 s, pulls the trigger, releases.
+Presses B (align) first, squeezes after 1 s, moves the hand 6 cm forward (WebXR -z) and 4 cm up over 2 s, pulls the
+trigger, releases.
 """
 import argparse
 import asyncio
@@ -35,10 +36,14 @@ async def main():
             k = (1 - math.cos(math.pi * k)) / 2
             p = [0.2, 1.0 + 0.04 * k, -0.3 - 0.06 * k]
             H = {"ok": True, "p": p, "q": [0, 0, 0, 1], "aim": [0, 0, -1],
-                 "sq": 1.0 if 1.0 < t < args.seconds - 1 else 0.0, "tr": k, "b": [0, 0, 0], "stick": [0, 0]}
+                 "sq": 1.0 if 1.0 < t < args.seconds - 1 else 0.0, "tr": k, "b": [0, 1 if 0.2 < t < 0.5 else 0, 0],
+                 "stick": [0, 0]}
             seq += 1
+            hands = {args.hand: H}
+            if args.hand != "right":  # B (align) is on the right controller
+                hands["right"] = {**H, "sq": 0.0, "tr": 0.0}
             await ws.send_str(json.dumps({"t": "xr", "seq": seq, "ts": t * 1000, "fps": args.hz, "head": None,
-                                          "hands": {args.hand: H}}))
+                                          "hands": hands}))
             await asyncio.sleep(1 / args.hz)
         rt.cancel()
 

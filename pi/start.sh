@@ -2,7 +2,7 @@
 # One command to start teleop on the Pi:  ~/teleop_openarm_system/pi/start.sh          (both arms)
 #                                          ~/teleop_openarm_system/pi/start.sh right    (one arm)
 # 1. stops old copies (arms park first), 2. resets both CAN buses (needed after any arm power unplug),
-# 3. starts the motor loop (both arms switch on, then the server raises them to the ready pose),
+# 3. starts the motor loop (the arms switch on and hold where they are),
 # 4. starts the server (https :8443 for Wi-Fi, http :8080 for the USB cable), 5. sets up the USB link
 # (adb reverse) and opens the teleop page in the headset if it is plugged in.
 cd "$(dirname "$0")/.." || exit 1
@@ -17,7 +17,7 @@ while pgrep -f "^.venv/bin/python pi/motor_loop.py" >/dev/null && [ $i -lt 30 ];
 echo "resetting CAN buses..."
 for b in can0 can1; do sudo ip link set "$b" down; sudo ip link set "$b" up type can bitrate 1000000; done
 
-echo "starting the server and the motor loop ($ARMS): THE ARMS SWITCH ON, then rise to point forward. Stand clear."
+echo "starting the server and the motor loop ($ARMS): THE ARMS SWITCH ON and hold where they are. Stand clear."
 setsid nohup .venv/bin/python pi/teleop_server.py --http-port 8080 > /tmp/brain.log 2>&1 &
 sleep 2
 sudo setsid nohup .venv/bin/python pi/motor_loop.py --arms "$ARMS" > /tmp/loop.log 2>&1 &

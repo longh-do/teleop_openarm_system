@@ -34,8 +34,7 @@ BASE = {"right": np.array([0.0, -0.031, 0.0]), "left": np.array([0.0, 0.031, 0.0
 _RL = [(-1.3963, 3.4907), (-0.1745, 3.3161), (-1.5708, 1.5708), (0.0, 2.4435), (-1.5708, 1.5708), (-0.7854, 0.7854), (-1.5708, 1.5708)]
 MODEL_LIMITS = {"right": np.array(_RL), "left": np.array([(-3.4907, 1.3963), (-3.3161, 0.1745)] + _RL[2:])}
 TOOL = np.array([0.0, 0.0, -0.10])  # grasp point in the flange frame
-MARGIN = math.radians(5)
-POSTURE = 0.08
+MARGIN = math.radians(2)  # the IK stays this far inside each joint's limit (limits are the robot's real ends)
 DAMP = 0.05
 
 CALIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib.json")
@@ -175,39 +174,95 @@ HOME_PULL = np.array([0.01, 0.01, 0.03, 0.01, 0.3, 0.3, 0.3])
 HOME_DEG = {"right": [20, 0, 0, 90, 90, 0, 0], "left": [-20, 0, 0, 90, -90, 0, 0]}
 
 
-def ik(arm, c, want_p, want_R, seed_motor, iters=6, tol=2e-4, rot_weight=0.5, mode="pose", frozen=()):
-    """Damped least squares from the seed (warm start), limits with a 5 deg margin (widened to admit the seed),
+def ik(arm, c, want_p, want_R, seed_motor, iters=6, tol=2e-4, rot_weight=0.5, mode="pose", frozen=(), home=None):
+    """Damped least squares from the seed (warm start), limits with a 2 deg margin (widened to admit the seed),
     then one posture step in the null space. -> (q_motor (7,), residual position error m, residual rotation rad).
-    mode "position": only the grasp point's position is a task; the hand's angle follows the arm, the wrist joints are
-    weighted expensive and pulled to the middle of their range (S5: holding a fixed hand angle while moving sideways
-    twisted J5 far enough to pull the J6 cable)."""
+    mode "pose" (teleop default): the grasp point's position first, then its angle with what position leaves free,
+    every joint over its full range; a joint that reaches its limit drops out so the others make up for it.
+    mode "position": only the grasp point's position is a task; the hand's angle follows the arm.
+    home: posture (model rad) the null space is pulled toward, default HOME_DEG; the server passes the pose at the
+    moment of the squeeze, so squeezing alone moves nothing. rot_weight is unused (kept for old callers)."""
     if mode == "position":
-        return _ik_position(arm, c, want_p, seed_motor, iters, tol, frozen)
+        return _ik_position(arm, c, want_p, seed_motor, iters, tol, frozen, home)
+    return _ik_pose(arm, c, want_p, want_R, seed_motor, iters, tol, frozen, home)
+
+
+# pose mode: per-call pull of the shoulder and elbow toward the home posture, only within what the 6-D task leaves
+# free (the elbow's swing). None on the wrist: pulling it back spread a forearm twist over the shoulder joints
+POSE_PULL = np.array([0.05, 0.05, 0.05, 0.05, 0.0, 0.0, 0.0])
+# pose mode: who does what, like a person: position mostly with the shoulder and elbow, the hand's angle mostly with
+# the wrist (an elbow bend can tilt the hand too, but swings the arm around to keep the grasp point in place)
+W_POS = np.array([1.0, 1.0, 1.0, 1.0, 0.02, 0.02, 0.02])
+# the shoulder never turns the hand: chasing an angle past the wrist's end swung it far out sideways (review 2026-10-21)
+W_ROT = np.array([0.0, 0.0, 0.0, 0.2, 1.0, 1.0, 1.0])
+ROT_STEP = 0.15  # rad of angle error taken per iteration at most
+
+
+def _two_level(J, ep, er, free):
+    """-> (position step, angle step in what position leaves free). free: 1 per usable joint, 0 = not used."""
+    Jp, Jr = J[:3], J[3:]
+    WJp = (W_POS * free)[:, None] * Jp.T
+    Jp_pinv = WJp @ np.linalg.inv(Jp @ WJp + DAMP ** 2 * np.eye(3))
+    dx1 = Jp_pinv @ ep
+    N = np.eye(7) - Jp_pinv @ Jp
+    JrN = Jr @ N
+    WJrN = (W_ROT * free)[:, None] * JrN.T
+    return dx1, N @ (WJrN @ np.linalg.solve(JrN @ WJrN + DAMP ** 2 * np.eye(3), er - Jr @ dx1))
+
+
+def _ik_pose(arm, c, want_p, want_R, seed_motor, iters, tol, frozen=(), home=None):
     x = to_model(c, seed_motor)
     lim = c["limits"]
     lo, hi = np.minimum(lim[:, 0] + MARGIN, x), np.maximum(lim[:, 1] - MARGIN, x)
-    W = np.diag([1, 1, 1, rot_weight, rot_weight, rot_weight])
-    for _ in range(iters):
-        p, R, J = _jac(arm, x)
-        e = np.concatenate([want_p - p, log_rot(want_R @ R.T)])
-        if np.linalg.norm(e[:3]) < tol and np.linalg.norm(e[3:]) < 5 * tol:
+    free0 = np.ones(7)
+    for j in frozen:  # a dead motor: the solver may not use it
+        free0[j - 1] = 0.0
+    p, R, J = _jac(arm, x)
+    # posture first, so the iterations below take back any slip it causes (run after them, the slip made the
+    # output cycle every 3 calls with the hand still). home sits a margin inside the limits: from the straight-down
+    # pose this bends the elbow a little, which is what lets the hand go up at all (a straight arm can't move along
+    # itself)
+    home = np.clip(np.radians(HOME_DEG[arm]) if home is None else home, lim[:, 0] + MARGIN, lim[:, 1] - MARGIN)
+    pull = POSE_PULL * (home - x)
+    # a joint pressed against its limit can't take part (pulling it out of the limit is fine)
+    free = free0 * ~(((x <= lo + 1e-3) & (pull < 0)) | ((x >= hi - 1e-3) & (pull > 0)))
+    WJ = free[:, None] * J.T
+    pinv = WJ @ np.linalg.inv(J @ WJ + DAMP ** 2 * np.eye(6))
+    xn = np.clip(x + (np.eye(7) - pinv @ J) @ (pull * free), lo, hi)
+    pn, Rn, Jn = _jac(arm, xn)
+    if np.linalg.norm(want_p - pn) <= np.linalg.norm(want_p - p) + 1e-4:
+        x, p, R, J = xn, pn, Rn, Jn
+    for it in range(iters):
+        ep, er = want_p - p, log_rot(want_R @ R.T)
+        # always one correction after the posture step: skipping it when the slip is under tol made a 3-call cycle
+        if it and np.linalg.norm(ep) < tol and np.linalg.norm(er) < 5 * tol:
             break
-        Jw, ew = W @ J, W @ e
-        dx = Jw.T @ np.linalg.solve(Jw @ Jw.T + DAMP ** 2 * np.eye(6), ew)
-        if (n := np.linalg.norm(dx)) > 0.15:
-            dx *= 0.15 / n
-        x = np.clip(x + dx, lo, hi)
-    span = lim[:, 1] - lim[:, 0]
-    pull = POSTURE * (lim.mean(1) - x) / span
-    pull[(x < lim[:, 0] + MARGIN) | (x > lim[:, 1] - MARGIN)] = 0.0
-    _, _, J = _jac(arm, x)
-    pinv = J.T @ np.linalg.inv(J @ J.T + DAMP ** 2 * np.eye(6))
-    x = np.clip(x + (np.eye(7) - pinv @ J) @ pull, lo, hi)
-    p, R, _, _ = _fk_model(arm, x)
+        if (n := np.linalg.norm(er)) > ROT_STEP:
+            er = er * (ROT_STEP / n)
+        dx1, dx2 = _two_level(J, ep, er, free0)
+        dx = dx1 + dx2
+        out = (free0 > 0) & (((x + dx < lo) & (dx < 0)) | ((x + dx > hi) & (dx > 0)))
+        if out.any():  # those joints go only to their limit; the rest re-solve what is left
+            d_out = np.clip(x + dx, lo, hi)[out] - x[out]
+            free = free0.copy()
+            free[out] = 0.0
+            dx1, dx2 = _two_level(J, ep - J[:3, out] @ d_out, er - J[3:, out] @ d_out, free)
+            dx1[out], dx2[out] = d_out, 0.0
+        # position comes first: take less of the angle step if it would cost position (at a limit it can't all fit)
+        e_ok = max(float(np.linalg.norm(ep)), 5e-4)
+        for k in (1.0, 0.5, 0.0):
+            step = dx1 + k * dx2
+            if (n := np.linalg.norm(step)) > 0.15:
+                step *= 0.15 / n
+            xn = np.clip(x + step, lo, hi)
+            pn, Rn, Jn = _jac(arm, xn)
+            if k == 0.0 or np.linalg.norm(want_p - pn) <= e_ok:
+                break
+        x, p, R, J = xn, pn, Rn, Jn
     return to_motor(c, x), float(np.linalg.norm(want_p - p)), float(np.linalg.norm(log_rot(want_R @ R.T)))
 
 
-def _ik_position(arm, c, want_p, seed_motor, iters, tol, frozen=()):
+def _ik_position(arm, c, want_p, seed_motor, iters, tol, frozen=(), home=None):
     x = to_model(c, seed_motor)
     lim = c["limits"]
     lo, hi = np.minimum(lim[:, 0] + MARGIN, x), np.maximum(lim[:, 1] - MARGIN, x)
@@ -216,17 +271,8 @@ def _ik_position(arm, c, want_p, seed_motor, iters, tol, frozen=()):
         w = w.copy()
         w[j - 1] = 0.0
     Winv = np.diag(w)
-    for _ in range(iters):
-        p, R, J = _jac(arm, x)
-        e = want_p - p
-        if np.linalg.norm(e) < tol:
-            break
-        Jp = J[:3]
-        dx = Winv @ Jp.T @ np.linalg.solve(Jp @ Winv @ Jp.T + DAMP ** 2 * np.eye(3), e)
-        if (n := np.linalg.norm(dx)) > 0.15:
-            dx *= 0.15 / n
-        x = np.clip(x + dx, lo, hi)
-    home = np.clip(np.radians(HOME_DEG[arm]), lim[:, 0] + MARGIN, lim[:, 1] - MARGIN)
+    # posture first, then the iterations take back any slip (see _ik_pose)
+    home = np.clip(np.radians(HOME_DEG[arm]) if home is None else home, lim[:, 0] + MARGIN, lim[:, 1] - MARGIN)
     pull = HOME_PULL * (home - x)
     for j in frozen:
         pull[j - 1] = 0.0
@@ -234,5 +280,15 @@ def _ik_position(arm, c, want_p, seed_motor, iters, tol, frozen=()):
     Jp = J[:3]
     pinv = Winv @ Jp.T @ np.linalg.inv(Jp @ Winv @ Jp.T + DAMP ** 2 * np.eye(3))
     x = np.clip(x + (np.eye(7) - pinv @ Jp) @ pull, lo, hi)
+    for it in range(iters):
+        p, R, J = _jac(arm, x)
+        e = want_p - p
+        if it and np.linalg.norm(e) < tol:  # always one correction after the posture step
+            break
+        Jp = J[:3]
+        dx = Winv @ Jp.T @ np.linalg.solve(Jp @ Winv @ Jp.T + DAMP ** 2 * np.eye(3), e)
+        if (n := np.linalg.norm(dx)) > 0.15:
+            dx *= 0.15 / n
+        x = np.clip(x + dx, lo, hi)
     p, R, _, _ = _fk_model(arm, x)
     return to_motor(c, x), float(np.linalg.norm(want_p - p)), 0.0

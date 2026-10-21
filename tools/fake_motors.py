@@ -29,7 +29,10 @@ def main():
     ap.add_argument("--drop-j1", type=float, default=0, help="J1 silent ~35 ms every N s (0 = never)")
     ap.add_argument("--start", default="0,-0.5,0,0.8,0,0,0,0.3")
     ap.add_argument("--dead", type=int, default=0, help="this joint never answers")
+    ap.add_argument("--lag-ms", type=float, default=25.0, help="joint response time (the real J5-J7 lag ~180 ms)")
+    ap.add_argument("--stops", default="", help="hard end stops, joint:lo:hi in motor rad, e.g. 7:-0.9:1.1,6:-0.6:0.7")
     args = ap.parse_args()
+    stops = {int(j): (float(lo), float(hi)) for j, lo, hi in (x.split(":") for x in args.stops.split(",") if x)}
     s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
     s.bind((args.bus,))
     pos = [0.0] + [float(x) for x in args.start.split(",")]
@@ -45,9 +48,11 @@ def main():
                 if j == 8:
                     step = (tgt[j] - pos[j]) * min(1.0, dt * mit_kp[j] * 2)
                 else:
-                    step = max(-spd[j] * dt, min(spd[j] * dt, (tgt[j] - pos[j]) * min(1.0, dt * 40)))
+                    step = max(-spd[j] * dt, min(spd[j] * dt, (tgt[j] - pos[j]) * min(1.0, dt * 1000 / args.lag_ms)))
                 vel[j] = step / dt if dt > 0 else 0.0
                 pos[j] += step
+                if j in stops and not stops[j][0] <= pos[j] <= stops[j][1]:
+                    pos[j], vel[j] = min(max(pos[j], stops[j][0]), stops[j][1]), 0.0
             else:
                 vel[j] = 0.0
         if now > next_drop:
@@ -75,6 +80,9 @@ def main():
         if j == 1 and now < drop_until or j == args.dead:
             continue
         tau = 0.5 * math.sin(now) if on[j] else 0.0
+        if on[j] and j in stops:  # pressing an end stop: torque grows with how far the command is past it
+            lo, hi = stops[j]
+            tau += 30.0 * (max(tgt[j] - hi, 0.0) + min(tgt[j] - lo, 0.0))
         s.send(struct.pack(dm.FRAME, 0x10 + j, 8, encode_reply(j, int(on[j]), pos[j], vel[j], tau, dm.VMAX[j], dm.TMAX[j])))
 
 
