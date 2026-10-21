@@ -82,6 +82,7 @@ class Arm:
         self.target_t, self.target_prev, self.brain_live = 0.0, None, False
         self.can_errors = 0
         self.err_max = [0.0] * n  # per joint, reset each stats second
+        self.tau_prev, self.ripple_sum, self.ripple_n = [None] * n, [0.0] * n, 0  # buzz detector
         self.late = [0] * n  # replies that arrived after the reply timeout, per joint
         self.tx_full = 0  # sends refused because the bus is not acknowledging
         self.limits = None  # motor-space (lo, hi) per joint 1-7 when calibration is verified
@@ -110,6 +111,26 @@ class Arm:
         self.set_mode("hold", why, log)
 
     # ---- bus ----------------------------------------------------------------------------------------------
+    def apply_gains(self, log):
+        """Motor-side tuning in RAM (S8): the factory position gain KP_APR=54 and ACC/DEC=2 make the joints trail a
+        streamed target by ~150 ms; others run KP_APR 200-400, ACC 10-50. Written with the motors off, at start and
+        at every power-on (an arm power cycle resets RAM). Never saved to flash."""
+        g = self.args.gains
+        if not g:
+            return
+        got = {}
+        for j in range(1, 8):
+            if j in self.skip:
+                continue
+            want = {dm.RID_KP_APR: g["kp_apr"][j - 1], dm.RID_ACC: g["acc"], dm.RID_DEC: -abs(g["acc"])}
+            for rid, val in want.items():
+                back = dm.write_register(self.sock, j, rid, float(val))
+                got.setdefault(j, []).append(None if back is None else round(back, 2))
+                if back is None or abs(back - val) > 1e-3 * max(1.0, abs(val)):
+                    log.event("gain_write_failed", arm=self.name, joint=j, rid=rid, want=val, got=back)
+        log.event("gains", arm=self.name, kp_apr=g["kp_apr"], acc=g["acc"], readback=got)
+        print(f"[{self.name}] gains in RAM: KP_APR {g['kp_apr']}, ACC/DEC +-{g['acc']} (read back {got})", flush=True)
+
     def read_registers(self, log):
         for j in JOINTS:
             if j in getattr(self, "skip", ()):
@@ -134,7 +155,7 @@ class Arm:
         speed = PARK_V if self.mode == "parking" else VMAX[j] * self.args.motor_speed_scale
         # the motors' own position loop trails its target like a ~0.14 s first-order lag (measured S2):
         # command ahead by speed x lag so the joint itself lands on the follower
-        lead_ms = self.args.lead_ms_34 if j in (3, 4) else self.args.lead_ms
+        lead_ms = self.args.lead_list[j - 1] if self.args.lead_list else (self.args.lead_ms_34 if j in (3, 4) else self.args.lead_ms)
         lead = self.v[j] * lead_ms / 1000 if self.mode in ("on", "parking", "hold", "fault") else 0.0
         return 0x100 + j, dm.posvel(self.x[j] + lead, speed)
 
@@ -177,6 +198,10 @@ class Arm:
             return 0
         j = can_id - 0x10
         if not 1 <= j <= 8 or (d[0] & 0x0F) != j:
+            return 0
+        if d[1] == 0 and d[2] in (0x33, 0x55):
+            # a register reply ([id, 0, 0x33/0x55, rid, value]) left in the queue, not feedback: reading it as a
+            # position would say "-12.49 rad" and preload a garbage target. Real joints never sit near -PMAX.
             return 0
         st, p, v, t, tm, tr = dm.decode(d, self.vmax_reg[j], self.tmax_reg[j])
         self.state[j], self.pos[j], self.vel[j], self.tau[j], self.temp[j] = st, p, v, t, max(tm, tr)
@@ -288,6 +313,11 @@ class Arm:
             if j == 8:
                 continue
             self.err_max[j] = max(self.err_max[j], abs(self.pos[j] - self.x[j]))
+            if self.tau_prev[j] is not None:
+                self.ripple_sum[j] += (self.tau[j] - self.tau_prev[j]) ** 2
+            self.tau_prev[j] = self.tau[j]
+            if j == 1:
+                self.ripple_n += 1
             if abs(self.pos[j] - self.x[j]) > (self.args.max_err_34 if j in (3, 4) else self.args.max_err):
                 return self.hold(f"J{j} tracking error {math.degrees(self.pos[j] - self.x[j]):+.1f} deg", log, True)
             if self.mode == "parking":
@@ -389,6 +419,7 @@ class Arm:
 
     def command(self, cmd, now, log):
         if cmd == "power_on" and self.mode == "off":
+            self.apply_gains(log)  # motors are off here; an arm power cycle may have reset them
             self.phase_t = now
             self.set_mode("starting_read", "reading joints (motors off)", log)
         elif cmd == "stop" and self.stop_t and 2.0 < now - self.stop_t < 20.0 and self.mode in ("parking", "hold", "fault"):
@@ -484,6 +515,11 @@ def main():
     ap.add_argument("--brain-timeout-ms", type=float, default=100)
     ap.add_argument("--max-err", type=float, default=0.15, help="rad: tracking error that means blocked -> hold")
     ap.add_argument("--max-err-34", type=float, default=0.30, help="same, for the sluggish DM4340 joints J3/J4")
+    ap.add_argument("--gains-file", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "gains.json"),
+                    help="motor RAM tuning: {kp_apr: [J1..J7], acc: x, lead_ms: [J1..J7]}; missing file = factory values")
+    ap.add_argument("--kp-apr", default="", help="override KP_APR for J1-J7: one value or 7 comma-separated (tests)")
+    ap.add_argument("--acc", type=float, default=None, help="override ACC/DEC (tests)")
+    ap.add_argument("--lead", default="", help="override velocity lead ms: one value or 7 comma-separated (tests)")
     ap.add_argument("--lead-ms", type=float, default=180, help="velocity lead to cancel the motors' position-loop lag")
     ap.add_argument("--lead-ms-34", type=float, default=350, help="same, for the DM4340 joints J3/J4")
     ap.add_argument("--motor-speed-scale", type=float, default=1.0, help="x the follower vmax, sent as the posvel speed limit")
@@ -505,6 +541,19 @@ def main():
     args = ap.parse_args()
 
     ARM_BUS.update(dict(kv.split("=") for kv in args.buses.split(",")))
+    args.gains, args.lead_list = None, None
+    if os.path.exists(args.gains_file):
+        with open(args.gains_file) as f:
+            gf = json.load(f)
+        args.gains = {"kp_apr": [float(v) for v in gf["kp_apr"]], "acc": float(gf["acc"])}
+        args.lead_list = [float(v) for v in gf["lead_ms"]] if "lead_ms" in gf else None
+    seven = lambda txt: [float(v) for v in txt.split(",")] * (7 if "," not in txt else 1)  # noqa: E731
+    if args.kp_apr or args.acc is not None:
+        base = args.gains or {"kp_apr": [54.0] * 7, "acc": 2.0}
+        args.gains = {"kp_apr": seven(args.kp_apr) if args.kp_apr else base["kp_apr"],
+                      "acc": args.acc if args.acc is not None else base["acc"]}
+    if args.lead:
+        args.lead_list = seven(args.lead)
     names = [a.strip() for a in args.arms.split(",") if a.strip()]
     assert all(n in ARM_BUS for n in names), f"--arms must be from {list(ARM_BUS)}"
     other = None if all(ARM_BUS[n].startswith("vcan") for n in names) else find_other_writer()
@@ -533,6 +582,7 @@ def main():
             lim = kin.motor_limits(a.name, calib[a.name], margin=-math.radians(10))
             a.limits = [tuple(map(float, row)) for row in lim]
         a.read_registers(log)
+        a.apply_gains(log)
     rt = realtime(args.cpu, args.prio)
     log.event("start", args=vars(args), realtime=rt, calib_verified={a.name: a.limits is not None for a in arms})
     print(f"motor loop: arms {names}, {args.hz:.0f} Hz, {rt}, log {log.path}", flush=True)
@@ -740,11 +790,13 @@ def stats(args, arms, periods, works, late, overruns, log, span, t_start):
            "arms": {a.name: {"mode": a.mode, "misses": a.misses[1:], "late": a.late[1:], "gaps": len(a.gaps), "can_errors": a.can_errors,
                              "max_err_deg": round(math.degrees(max(a.err_max[1:8])), 2),
                              "err_deg": [round(math.degrees(e), 2) for e in a.err_max[1:8]],
+                             "ripple": [round(math.sqrt(a.ripple_sum[j] / a.ripple_n), 3) if a.ripple_n else 0.0 for j in range(1, 8)],
                              "max_tau": [round(a.tau[j], 1) for j in JOINTS],
                              "temp": a.temp[1:]} for a in arms}}
     log.event("stats", **rec)
     for a in arms:
         a.err_max = [0.0] * 9
+        a.ripple_sum, a.ripple_n = [0.0] * 9, 0
     log.flush()
     parts = [f"{rec['hz']:6.1f} Hz", f"p99 {rec['p99_period_ms']:.2f} ms", f"max {rec['max_period_ms']:.2f}",
              f"work p99 {rec['p99_work_ms']:.2f}", f"on-time {on_time * 100:.2f}%", f"overruns {overruns}"]

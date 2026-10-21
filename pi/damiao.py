@@ -13,6 +13,7 @@ PMAX = 12.5
 VMAX = {1: 45.0, 2: 45.0, 3: 8.0, 4: 8.0, 5: 30.0, 6: 30.0, 7: 30.0, 8: 50.0}
 TMAX = {1: 54.0, 2: 54.0, 3: 28.0, 4: 28.0, 5: 10.0, 6: 10.0, 7: 10.0, 8: 10.0}
 RID_PMAX, RID_VMAX, RID_TMAX, RID_CTRL_MODE = 0x15, 0x16, 0x17, 0x0A
+RID_ACC, RID_DEC, RID_KP_APR, RID_KI_APR = 0x04, 0x05, 0x1B, 0x1C
 STATUS = {0: "off", 1: "on", 8: "over-voltage", 9: "under-voltage", 0xA: "over-current",
           0xB: "MOSFET overheat", 0xC: "coil overheat", 0xD: "comms lost", 0xE: "overload"}
 CAN_ERR_FLAG = 0x20000000
@@ -83,6 +84,15 @@ def read_register(s, motor, rid, timeout=0.05, fmt="<f"):
         if not can_id & CAN_ERR_FLAG and d[2] in (0x33, 0x55) and d[0] == motor and d[3] == rid:
             return struct.unpack(fmt, d[4:8])[0]
     return None
+
+
+def write_register(s, motor, rid, value, timeout=0.05, fmt="<f"):
+    """Write a motor register in RAM only (0x55; lost at power-off, nothing saved to flash: that would need 0xAA,
+    which this module never sends). Only while nothing else is talking on this bus. -> value read back, or None."""
+    send(s, 0x7FF, bytes([motor, 0, 0x55, rid]) + struct.pack(fmt, value))
+    import time
+    time.sleep(0.002)
+    return read_register(s, motor, rid, timeout, fmt)
 
 
 def _selftest():
