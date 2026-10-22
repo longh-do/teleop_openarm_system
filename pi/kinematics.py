@@ -154,6 +154,14 @@ def fk(arm, c, q_motor):
     return p, R
 
 
+def tool_force(arm, c, q_motor, dtau_motor):
+    """Force (rig frame, N) the grasp point presses with, from a change of joint torques (motor Nm, e.g. now minus
+    before contact, which removes gravity): static tau = J^T F, solved for F by least squares."""
+    _, _, J = _jac(arm, to_model(c, q_motor))
+    Jp = J[:3]
+    return np.linalg.solve(Jp @ Jp.T + 1e-4 * np.eye(3), Jp @ (c["sign"] * np.asarray(dtau_motor, float)[:7]))
+
+
 def elbow_wrist_points(arm, c, q_motor):
     """Joint origins (for calibration plots / checks)."""
     _, _, o, _ = _fk_model(arm, to_model(c, q_motor))

@@ -30,6 +30,7 @@ def main():
     ap.add_argument("--start", default="0,-0.5,0,0.8,0,0,0,0.3")
     ap.add_argument("--dead", type=int, default=0, help="this joint never answers")
     ap.add_argument("--lag-ms", type=float, default=25.0, help="joint response time (the real J5-J7 lag ~180 ms)")
+    ap.add_argument("--stop-k", type=float, default=30.0, help="Nm/rad an end stop pushes back (the real arm: ~700)")
     ap.add_argument("--stops", default="", help="hard end stops, joint:lo:hi in motor rad, e.g. 7:-0.9:1.1,6:-0.6:0.7")
     args = ap.parse_args()
     stops = {int(j): (float(lo), float(hi)) for j, lo, hi in (x.split(":") for x in args.stops.split(",") if x)}
@@ -82,7 +83,7 @@ def main():
         tau = 0.5 * math.sin(now) if on[j] else 0.0
         if on[j] and j in stops:  # pressing an end stop: torque grows with how far the command is past it
             lo, hi = stops[j]
-            tau += 30.0 * (max(tgt[j] - hi, 0.0) + min(tgt[j] - lo, 0.0))
+            tau += args.stop_k * (max(tgt[j] - hi, 0.0) + min(tgt[j] - lo, 0.0))
         s.send(struct.pack(dm.FRAME, 0x10 + j, 8, encode_reply(j, int(on[j]), pos[j], vel[j], tau, dm.VMAX[j], dm.TMAX[j])))
 
 

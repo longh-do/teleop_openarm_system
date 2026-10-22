@@ -48,7 +48,9 @@ On the Quest: open `https://<pi-ip>:8443`, accept the self-signed certificate on
 |---|---|
 | **B** (right) | Align, once per session: stand beside the robot facing the way it faces, point the right controller straight ahead, press B |
 | **Grip**, hold | Drive that arm: its gripper follows where your hand is **and how it is turned** (twist, tilt). Hold the controller the way the gripper points. Release to freeze. |
-| **Trigger** (while holding grip) | Close that gripper; release to open. After you grab again it waits until the trigger reaches the gripper's current opening, so a held object stays held |
+| **Trigger** (while holding grip) | Close that gripper; release to open. Pulled fully, it squeezes with up to 3 Nm (`motor_loop.py --grip-torque`). After you grab again it waits until the trigger reaches the gripper's current opening, so a held object stays held |
+| **Thumbstick tilt** (while holding grip) | Forward/back: slide the gripper straight in/out along the way it points (the plug's axis); left/right: slide sideways. Up to 1.5 cm/s (0.5 in fine mode); your hand is ignored meanwhile. Pushing in or sideways stops at 30 N (`teleop_server.py --push-n`, estimated from the joint torques); the headset shows the force and the controller buzzes. Pulling out is not limited |
+| **Thumbstick click** (while holding grip) | Insertion lock: your hand moves the gripper only straight in/out, angle frozen |
 | **A / X** | Fine mode: moves and turns 3x smaller and slower, for precise moves |
 | **Y** (left) | STOP: park both arms and switch off |
 

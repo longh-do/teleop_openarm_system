@@ -39,8 +39,11 @@ FINE_LEAD = 0.3  # fine mode / insertion lock: the loop's velocity lead x0.3, so
 # axis); left/right = move to the operator's left/right, sideways to that axis (lining the plug up with a port)
 SLIDE_V, SLIDE_V_FINE = 0.015, 0.005  # m/s at full tilt (normal / fine mode); response is squared for fine control
 SLIDE_DZ = 0.15  # stick deadzone
-SLIDE_AHEAD = 0.005  # m: sliding in stops while the target is this far ahead of the measured grasp point (contact:
-# the plug met resistance; pushing on would only build force), and buzzes
+# sliding in (or sideways) stops, with a buzz, once the gripper presses with --push-n newtons (estimated from the joint
+# torques' change since the slide started), or as a backstop once the target is SLIDE_AHEAD past the measured grasp
+# point (kept under the loop's 'fell behind' limit). 2026-10-22: the old 5 mm stop pressed with only a few newtons,
+# too little to seat a plug; the real arm is stiff (16 Nm at 1.3 deg on J2), so 30 N comes within ~7 mm
+SLIDE_AHEAD = 0.025
 XR_TIMEOUT = 0.15  # s without controller data -> disengage
 # No "ready pose": the arms never move on their own, driving starts from wherever they are (2026-10-21: raising both
 # arms to point forward overloaded the left shoulder motors and the arm fell). From hanging straight down every
@@ -131,6 +134,9 @@ class ArmBrain:
         self.slide_side = 0.0  # and sideways, m/s (+ = the operator's right)
         self.grip_side = 0.0  # after a squeeze: +-1 while the trigger hasn't yet reached the gripper's opening
         self.blocked = []  # joints at their end that stop the gripper following the hand (for the headset panel)
+        self.push_ref = None  # joint torques before the push (gravity), where and when they were taken
+        self.push_f = np.zeros(3)  # estimated force the gripper presses with while sliding (N, robot frame, smoothed)
+        self.push_now = 0.0  # ...along the direction it is sliding (for the headset panel)
 
     def on_tel(self, t, now):
         """New telemetry. If the loop reset its follower (epoch changed), re-sync and drop the clutch."""
@@ -176,6 +182,16 @@ class ArmBrain:
         axis) and the gripper keeps its angle; sideways hand motion and turning are ignored. Both switches re-anchor
         on the current (filtered) hand and commanded pose, so nothing jumps."""
         self.lock = {"p0": self.ee_p.copy(), "axis": -self.ee_R[:, 2].copy(), "R": self.ee_R.copy()} if on else None
+        if self.lock and self.tel is not None:
+            # torques before contact: the push force is their change. Back at the same spot soon after the last push,
+            # keep the old ones: the plug may already be pressing, and that force must count
+            now, q = time.monotonic(), np.array(self.tel["q"][:7])
+            p_meas = kin.fk(self.name, self.calib, q)[0]
+            r = self.push_ref
+            if not (r and now - r["t"] < 20 and float(np.linalg.norm(p_meas - r["p"])) < 0.03):
+                self.push_ref = {"tau0": np.array(self.tel["tau"][:7]), "p": p_meas}
+            self.push_ref["t"] = now
+            self.push_f, self.push_now = np.zeros(3), 0.0
         if self.lock:  # the operator's right (robot -y after B), minus any part along the plug axis; none if it is the axis
             side = np.array([0.0, -1.0, 0.0])
             side -= self.lock["axis"] * float(np.dot(side, self.lock["axis"]))
@@ -206,13 +222,21 @@ class ArmBrain:
         slide_hit = False
         if self.lock and self.sliding:  # thumbstick: in/out along the plug's axis and sideways; the hand is ignored
             L = self.lock
-            meas = kin.fk(self.name, self.calib, np.array(self.tel["q"][:7]))[0] if self.tel is not None else None
-            # pushing in or sideways stops while the target is SLIDE_AHEAD past the real grasp point (it met
-            # resistance: pushing on would only build force); pulling out is not capped, so a plug can be unplugged
+            meas = None
+            if self.tel is not None and self.push_ref is not None:
+                q_meas = np.array(self.tel["q"][:7])
+                meas = kin.fk(self.name, self.calib, q_meas)[0]
+                f = kin.tool_force(self.name, self.calib, q_meas, np.array(self.tel["tau"][:7]) - self.push_ref["tau0"])
+                self.push_f = 0.7 * self.push_f + 0.3 * f
+                self.push_now = max(0.0, float(np.dot(self.push_f, L["axis"]))) if self.slide_v > 0 else 0.0
+            # pushing in or sideways stops at --push-n newtons (or SLIDE_AHEAD past the real grasp point); pulling
+            # out is not capped, so a plug can be unplugged
             for d, v, capped in ((L["axis"], self.slide_v, self.slide_v > 0), (L["side"], self.slide_side, True)):
                 if d is None or v == 0.0:
                     continue
-                if capped and meas is not None and float(np.dot(L["p0"] - meas, d)) * math.copysign(1.0, v) > SLIDE_AHEAD:
+                if capped and meas is not None and (
+                        float(np.dot(L["p0"] - meas, d)) * math.copysign(1.0, v) > SLIDE_AHEAD or
+                        float(np.dot(self.push_f, d)) * math.copysign(1.0, v) > self.args.push_n):
                     slide_hit = True
                     continue
                 L["p0"] = L["p0"] + d * v * dt
@@ -260,6 +284,7 @@ class ArmBrain:
         self.trace["res_deg"] = round(math.degrees(res_r), 1)
         self.trace["grip"] = None if self.g_cmd is None else round(float(self.g_cmd), 3)
         self.trace["lock"] = self.lock is not None
+        self.trace["push_n"] = round(self.push_now, 1)
         lim, edge = self.calib["limits"], kin.MARGIN + math.radians(0.5)
         self.blocked = [j + 1 for j in range(7) if x[j] <= lim[j, 0] + edge or x[j] >= lim[j, 1] - edge] \
             if res_p > 0.005 or res_r > math.radians(3) else []
@@ -580,7 +605,9 @@ class Brain:
                                             "Point the RIGHT controller straight ahead, then press B."], "info")
         if driving := [n for n in used if self.arms[n].engaged]:
             ends = [f"{n.upper()} {JOINT_NAMES[self.arms[n].blocked[0] - 1]} is at its end" for n in driving if self.arms[n].blocked]
-            return out(f"Driving {name(driving)}", ends + ["Release the grip to freeze the arm.", "Trigger closes the gripper. Y = STOP."], "ok")
+            pushes = [f"{n.upper()} pushing {self.arms[n].push_now:.0f} N (max {self.args.push_n:.0f})" for n in driving
+                      if self.arms[n].sliding and self.arms[n].push_now > 3]
+            return out(f"Driving {name(driving)}", pushes + ends + ["Release the grip to freeze the arm.", "Trigger closes the gripper. Y = STOP."], "ok")
         return out("Ready to drive", ["Hold a GRIP to move that arm. Trigger = gripper.",
                                       "A/X fine mode - Y = STOP"], "ok")
 
@@ -718,6 +745,7 @@ def main():
     ap.add_argument("--fine-amax", type=float, default=0.3, help="same, fine mode")
     ap.add_argument("--wmax", type=float, default=2.0, help="end-effector rotation cap rad/s (the wrist joints' own top speed)")
     ap.add_argument("--jump", type=float, default=0.05, help="max target step per sample, m")
+    ap.add_argument("--push-n", type=float, default=30.0, help="N: the thumbstick push in stops at this force")
     ap.add_argument("--min-cutoff", type=float, default=2.0)
     # beta multiplies the hand speed in m/s: 0.04 (Enactic's value) made the filter a fixed ~2 Hz low-pass with
     # ~80 ms delay at every speed; 20 keeps the same still-hand steadiness with 11-22 ms delay (measured on the Pi)

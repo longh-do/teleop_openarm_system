@@ -41,9 +41,13 @@ JOINTS = range(1, 9)
 VMAX = {1: 1.0, 2: 1.0, 3: 0.6, 4: 0.6, 5: 2.0, 6: 2.0, 7: 2.0, 8: 3.0}  # rad/s
 AMAX = {1: 4.0, 2: 4.0, 3: 3.0, 4: 3.0, 5: 4.0, 6: 4.0, 7: 4.0, 8: 12.0}  # rad/s^2
 PARK_V, PARK_A = 0.3, 1.0
-BLOCK_TORQUE = {1: 15.0, 2: 15.0, 3: 10.0, 4: 10.0, 5: 4.0, 6: 4.0, 7: 4.0}  # Nm, sustained -> hold
+# Nm, sustained -> hold. Raised 2026-10-22 (was 15/15/10/10/4/4/4): pushing a plug into the adapter needs a firm push,
+# and the lower values paused the arm halfway (the user accepts the stronger pushes)
+BLOCK_TORQUE = {1: 30.0, 2: 30.0, 3: 20.0, 4: 20.0, 5: 6.0, 6: 6.0, 7: 6.0}
 TORQUE_CYCLES = 10  # consecutive cycles over BLOCK_TORQUE before tripping
-GRIP_KP, GRIP_KD, GRIP_TORQUE = 8.0, 0.5, 1.0  # MIT gains; command clamped to +-GRIP_TORQUE/KP around the position
+# MIT gains; the command is clamped to +-grip torque/KP around the position, so the squeeze tops out at the grip torque
+# (--grip-torque; 1.0 Nm let a cable slip in the fingers while pushing it into the adapter, 2026-10-21)
+GRIP_KP, GRIP_KD, GRIP_TORQUE = 8.0, 0.5, 3.0
 JUMP_GUARD = 0.5  # rad: a target this far from the follower is refused
 BACKOFF = math.radians(3)  # rad a strained joint is backed off its obstacle on a torque trip
 TEMP_HOLD, TEMP_PARK = 70, 80  # degC (max of MOSFET / rotor): hold, then park
@@ -153,7 +157,7 @@ class Arm:
         if self.mode == "enabling":
             return j, dm.ENABLE
         if j == 8:
-            lead = GRIP_TORQUE / GRIP_KP
+            lead = self.args.grip_torque / GRIP_KP
             p = clamp(self.x[8], self.pos[8] - lead, self.pos[8] + lead) if self.seen[8] else self.x[8]
             return 8, dm.mit(p, 0.0, GRIP_KP, GRIP_KD, 0.0, self.vmax_reg[8], self.tmax_reg[8])
         speed = PARK_V if self.mode == "parking" else \
@@ -558,6 +562,7 @@ def main():
     ap.add_argument("--motor-speed-scale", type=float, default=1.0, help="x the follower vmax, sent as the posvel speed limit")
     ap.add_argument("--motor-speed-scale-34", type=float, default=1.0,
                     help="extra x for J3/J4 only: posvel speed headroom so the sluggish DM4340s can catch up (test 1.5)")
+    ap.add_argument("--grip-torque", type=float, default=GRIP_TORQUE, help="Nm: the grippers' strongest squeeze")
     ap.add_argument("--park-timeout", type=float, default=30)
     ap.add_argument("--read-only", action="store_true", help="never enable; print angles once a second")
     ap.add_argument("--test", choices=["none", "hold", "sine", "probe"], default="none")
