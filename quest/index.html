@@ -61,7 +61,7 @@
     <li><b>Hold GRIP</b> = drive that arm (release = freeze). The gripper copies where your hand is <b>and how it is turned</b>: hold the controller the way the gripper points</li>
     <li><b>TRIGGER</b> (while holding grip) = close gripper. After you grab again, the gripper waits until the trigger reaches its current opening, so a held object stays held</li>
     <li><b>B</b> = align (stand beside the robot facing its way, point right controller straight ahead)</li>
-    <li><b>A / X</b> = fine mode: moves 4x and turns 3x smaller, slow and without overshoot, for lining up a plug</li>
+    <li><b>A / X</b> = fine mode: moves and turns 2x smaller (up to 6 cm/s), for lining up a plug</li>
     <li><b>Hold thumbstick down while driving</b> = insertion lock: the gripper only slides straight in/out along its pointing direction, angle frozen</li>
     <li><b>Hold RIGHT thumbstick 1 s</b> (arms off) = switch arms on</li>
     <li><b>Y</b> = STOP (arms lower and switch off)</li>
@@ -429,8 +429,10 @@ function onXRFrame(t, frame) {
 
 // ---------------- Guide panel in the headset: text on a 2D canvas -> texture -> one quad per eye ----------------
 const HUD_W = 1024, HUD_H = 512;                       // canvas pixels
-const HUD_SIZE = [0.55, 0.275], HUD_DIST = 1.0, HUD_DROP = 0.30, HUD_FOLLOW = 0.1;   // metres; easing per frame
-const HUD_TILT = Math.atan2(HUD_DROP, HUD_DIST);      // lean back so the panel faces the eyes
+// 2026-10-22: above eye level (HUD_DROP < 0 = up, ~20 deg) and smaller, so it never covers the table and the arms you
+// look down at while driving; glance up to read it. It was 0.3 m below eye level, right in the work area.
+const HUD_SIZE = [0.40, 0.20], HUD_DIST = 1.2, HUD_DROP = -0.45, HUD_FOLLOW = 0.1;   // metres; easing per frame
+const HUD_TILT = Math.atan2(HUD_DROP, HUD_DIST);      // lean so the panel faces the eyes
 const HUD_FONT = 'system-ui, Roboto, sans-serif';
 const hudCanvas = document.createElement('canvas');
 hudCanvas.width = HUD_W; hudCanvas.height = HUD_H;

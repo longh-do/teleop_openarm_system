@@ -32,12 +32,13 @@ ALIGN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "align.jso
 # WebXR 'local' (x right, y up, z back) -> robot (x forward, y left, z up), operator facing robot-forward
 M0 = np.array([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 SQ_ON, SQ_OFF = 0.7, 0.3
-FINE = 0.3  # fine mode: turning 0.3x
-FINE_POS = 0.25  # fine mode: moving 0.25x (4 cm of hand = 1 cm of gripper), for lining up a plug
-FINE_LEAD = 0.3  # fine mode / insertion lock: the loop's velocity lead x0.3, so the gripper doesn't overshoot a stop
+# fine mode (2026-10-22, user: "so slow"; was 0.3x turning, 0.25x moving, lead x0.3, 3 cm/s, 0.3 m/s^2, slide 5 mm/s)
+FINE = 0.5  # fine mode: turning 0.5x
+FINE_POS = 0.5  # fine mode: moving 0.5x (2 cm of hand = 1 cm of gripper), for lining up a plug
+FINE_LEAD = 0.6  # fine mode / insertion lock: the loop's velocity lead x0.6 (less overshoot at a stop, less lag than x0.3)
 # thumbstick tilt while driving: forward/back = slide straight in/out along the gripper's pointing direction (the plug's
 # axis); left/right = move to the operator's left/right, sideways to that axis (lining the plug up with a port)
-SLIDE_V, SLIDE_V_FINE = 0.015, 0.005  # m/s at full tilt (normal / fine mode); response is squared for fine control
+SLIDE_V, SLIDE_V_FINE = 0.015, 0.008  # m/s at full tilt (normal / fine mode); response is squared for fine control
 SLIDE_DZ = 0.15  # stick deadzone
 # sliding in (or sideways) stops, with a buzz, once the gripper presses with --push-n newtons (estimated from the joint
 # torques' change since the slide started), or as a backstop once the target is SLIDE_AHEAD past the measured grasp
@@ -51,7 +52,8 @@ XR_TIMEOUT = 0.15  # s without controller data -> disengage
 # joint speed the motor loop's follower allows (motor_loop VMAX); IK steps are kept under 90% of it, so the brain
 # never asks for a jump the loop would refuse (19:36: from the straight-down pose the IK asked J4 for 29 deg at once)
 LOOP_VMAX = np.array([1.0, 1.0, 0.6, 0.6, 2.0, 2.0, 2.0])
-GRIP_RATE = 3.0  # rad/s
+# gripper command speed, rad/s (--grip-rate): 2026-10-22 slowed from 3.0 (a full close took 0.35 s) to 1.2 (0.9 s), so
+# the squeeze on a held object can be set finely with the trigger
 GRIP_CATCH = 0.05  # rad: after a squeeze the gripper waits until the trigger comes this close to its current opening
 JOINT_NAMES = ["shoulder (fwd/back)", "shoulder (out/in)", "upper-arm twist", "elbow", "forearm twist", "wrist bend",
                "wrist turn"]
@@ -307,7 +309,7 @@ class ArmBrain:
         if self.grip_side and d * self.grip_side > GRIP_CATCH:
             return  # wait until the trigger reaches the gripper's opening, then follow it
         self.grip_side = 0.0
-        self.g_cmd += max(-GRIP_RATE * dt, min(GRIP_RATE * dt, d))
+        self.g_cmd += max(-self.args.grip_rate * dt, min(self.args.grip_rate * dt, d))
 
 
 class Brain:
@@ -740,11 +742,12 @@ def main():
     ap.add_argument("--tel-port", type=int, default=47002)
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--vmax", type=float, default=0.15, help="end-effector speed cap m/s")
-    ap.add_argument("--fine-vmax", type=float, default=0.03, help="fine mode grasp-point speed cap m/s")
+    ap.add_argument("--fine-vmax", type=float, default=0.06, help="fine mode grasp-point speed cap m/s")
     ap.add_argument("--amax", type=float, default=1.5, help="grasp-point acceleration limit m/s^2 (smooth follower)")
-    ap.add_argument("--fine-amax", type=float, default=0.3, help="same, fine mode")
+    ap.add_argument("--fine-amax", type=float, default=0.8, help="same, fine mode")
     ap.add_argument("--wmax", type=float, default=2.0, help="end-effector rotation cap rad/s (the wrist joints' own top speed)")
     ap.add_argument("--jump", type=float, default=0.05, help="max target step per sample, m")
+    ap.add_argument("--grip-rate", type=float, default=1.2, help="rad/s the gripper opens/closes at (full travel ~1.1 rad)")
     ap.add_argument("--push-n", type=float, default=30.0, help="N: the thumbstick push in stops at this force")
     ap.add_argument("--min-cutoff", type=float, default=2.0)
     # beta multiplies the hand speed in m/s: 0.04 (Enactic's value) made the filter a fixed ~2 Hz low-pass with
