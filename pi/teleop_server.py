@@ -32,7 +32,15 @@ ALIGN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "align.jso
 # WebXR 'local' (x right, y up, z back) -> robot (x forward, y left, z up), operator facing robot-forward
 M0 = np.array([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 SQ_ON, SQ_OFF = 0.7, 0.3
-FINE = 0.3
+FINE = 0.3  # fine mode: turning 0.3x
+FINE_POS = 0.25  # fine mode: moving 0.25x (4 cm of hand = 1 cm of gripper), for lining up a plug
+FINE_LEAD = 0.3  # fine mode / insertion lock: the loop's velocity lead x0.3, so the gripper doesn't overshoot a stop
+# thumbstick tilt while driving: forward/back = slide straight in/out along the gripper's pointing direction (the plug's
+# axis); left/right = move to the operator's left/right, sideways to that axis (lining the plug up with a port)
+SLIDE_V, SLIDE_V_FINE = 0.015, 0.005  # m/s at full tilt (normal / fine mode); response is squared for fine control
+SLIDE_DZ = 0.15  # stick deadzone
+SLIDE_AHEAD = 0.005  # m: sliding in stops while the target is this far ahead of the measured grasp point (contact:
+# the plug met resistance; pushing on would only build force), and buzzes
 XR_TIMEOUT = 0.15  # s without controller data -> disengage
 # No "ready pose": the arms never move on their own, driving starts from wherever they are (2026-10-21: raising both
 # arms to point forward overloaded the left shoulder motors and the arm fell). From hanging straight down every
@@ -117,6 +125,10 @@ class ArmBrain:
         self.ik_ms, self.ik_res = [], []
         self.resume_t = -10.0
         self.stick_t = None  # when this hand's thumbstick went down (hold 1 s with the arms off = power on)
+        self.ee_v = np.zeros(3)  # commanded grasp-point velocity (smooth follower)
+        self.lock = None  # insertion lock: {p0, axis, R} while the thumbstick is held or tilted during driving
+        self.sliding, self.slide_v = False, 0.0  # thumbstick tilted: slide speed along the plug axis, m/s (+ = in)
+        self.slide_side = 0.0  # and sideways, m/s (+ = the operator's right)
         self.grip_side = 0.0  # after a squeeze: +-1 while the trigger hasn't yet reached the gripper's opening
         self.blocked = []  # joints at their end that stop the gripper following the hand (for the headset panel)
 
@@ -151,12 +163,29 @@ class ArmBrain:
         self.f_pos.reset(Cp)
         self.q_smooth = np.array(Cq, float)
         self.anchor = {"C0p": np.array(Cp), "C0R": kin.quat_to_mat(Cq), "E0p": E0p, "E0R": E0R,
-                       "s": self.args.scale * (FINE if self.fine else 1.0),
+                       "s": self.args.scale * (FINE_POS if self.fine else 1.0),
                        "r": self.args.rot_scale * (FINE if self.fine else 1.0), "prev": np.eye(3), "acc": np.eye(3)}
         self.ee_p, self.ee_R = E0p.copy(), E0R.copy()
+        self.ee_v, self.lock, self.sliding = np.zeros(3), None, False
         self.grip_side = None  # decided on the first trigger sample
         self.blocked = []
         self.engaged = True
+
+    def set_lock(self, on):
+        """Insertion lock: while on, the grasp point only slides along the gripper's pointing direction (the plug's
+        axis) and the gripper keeps its angle; sideways hand motion and turning are ignored. Both switches re-anchor
+        on the current (filtered) hand and commanded pose, so nothing jumps."""
+        self.lock = {"p0": self.ee_p.copy(), "axis": -self.ee_R[:, 2].copy(), "R": self.ee_R.copy()} if on else None
+        if self.lock:  # the operator's right (robot -y after B), minus any part along the plug axis; none if it is the axis
+            side = np.array([0.0, -1.0, 0.0])
+            side -= self.lock["axis"] * float(np.dot(side, self.lock["axis"]))
+            n = float(np.linalg.norm(side))
+            self.lock["side"] = side / n if n > 0.3 else None
+        a = self.anchor
+        a["C0p"], a["E0p"] = self.f_pos.x.copy(), self.ee_p.copy()
+        a["C0R"], a["E0R"] = kin.quat_to_mat(self.q_smooth), self.ee_R.copy()
+        if "acc" in a:  # fine-mode turn accumulator restarts from the new anchor
+            a["prev"], a["acc"] = np.eye(3), np.eye(3)
 
     def drive(self, Cp, Cq, M, dt):
         """One pose sample while engaged -> new q_cmd. Cp/Cq in WebXR coordinates. Returns 'limit' on a cap hit."""
@@ -174,13 +203,40 @@ class ArmBrain:
             a["prev"] = turn
             turn = a["acc"]
         target_R = turn @ a["E0R"]
-        vmax = self.args.vmax * (self.args.fine_vmax / self.args.vmax if self.fine else 1.0)
-        step = target_p - self.ee_p
-        n = float(np.linalg.norm(step))
-        lim = min(vmax * dt, self.args.jump)
-        capped = n > lim
-        if capped:
-            step *= lim / n
+        slide_hit = False
+        if self.lock and self.sliding:  # thumbstick: in/out along the plug's axis and sideways; the hand is ignored
+            L = self.lock
+            meas = kin.fk(self.name, self.calib, np.array(self.tel["q"][:7]))[0] if self.tel is not None else None
+            # pushing in or sideways stops while the target is SLIDE_AHEAD past the real grasp point (it met
+            # resistance: pushing on would only build force); pulling out is not capped, so a plug can be unplugged
+            for d, v, capped in ((L["axis"], self.slide_v, self.slide_v > 0), (L["side"], self.slide_side, True)):
+                if d is None or v == 0.0:
+                    continue
+                if capped and meas is not None and float(np.dot(L["p0"] - meas, d)) * math.copysign(1.0, v) > SLIDE_AHEAD:
+                    slide_hit = True
+                    continue
+                L["p0"] = L["p0"] + d * v * dt
+            target_p, target_R = L["p0"].copy(), L["R"]
+        elif self.lock:  # insertion lock: only along the plug's axis, angle frozen
+            L = self.lock
+            target_p = L["p0"] + L["axis"] * float(np.dot(target_p - L["p0"], L["axis"]))
+            target_R = L["R"]
+        # smooth follower: speed AND acceleration limited, braking early enough to stop on the target (no hard-clamp
+        # rubber band, no dead stop). A target moving at u trails by u^2 / (2 amax): 3 mm at 0.1 m/s.
+        vmax, amax = (self.args.fine_vmax, self.args.fine_amax) if self.fine else (self.args.vmax, self.args.amax)
+        e = target_p - self.ee_p
+        d = float(np.linalg.norm(e))
+        v_des = e * (min(vmax, math.sqrt(2 * amax * d)) / d) if d > 1e-9 else np.zeros(3)
+        dv = v_des - self.ee_v
+        if (n := float(np.linalg.norm(dv))) > amax * dt:
+            dv *= amax * dt / n
+        self.ee_v = self.ee_v + dv
+        step = self.ee_v * dt
+        if (n := float(np.linalg.norm(step))) > self.args.jump:
+            step *= self.args.jump / n
+        if float(np.linalg.norm(step)) >= d:  # would pass the target: land on it
+            step = e
+            self.ee_v = e / dt if dt > 0 else np.zeros(3)
         self.ee_p = self.ee_p + step
         self.ee_R, rcap = cap_rotation(self.ee_R, target_R, self.args.wmax * dt)
         self.trace = {"hand_cm": [round(float(v) * 100, 1) for v in M @ (np.asarray(Cp, float) - a["C0p"])],
@@ -195,6 +251,7 @@ class ArmBrain:
         if over > 1.0:  # too fast for the joints: take the same direction, smaller step, and re-anchor the pose
             q = self.q_cmd + dq / over
             self.ee_p, self.ee_R = kin.fk(self.name, self.calib, q)
+            self.ee_v = self.ee_v / over
             res_p = res_r = 0.0
         self.q_cmd = q
         x = kin.to_model(self.calib, q)
@@ -202,15 +259,17 @@ class ArmBrain:
         self.trace["res_mm"] = round(res_p * 1000, 1)
         self.trace["res_deg"] = round(math.degrees(res_r), 1)
         self.trace["grip"] = None if self.g_cmd is None else round(float(self.g_cmd), 3)
+        self.trace["lock"] = self.lock is not None
         lim, edge = self.calib["limits"], kin.MARGIN + math.radians(0.5)
         self.blocked = [j + 1 for j in range(7) if x[j] <= lim[j, 0] + edge or x[j] >= lim[j, 1] - edge] \
             if res_p > 0.005 or res_r > math.radians(3) else []
         if res_p > 0.01:  # unreachable: stop the commanded pose running away from the arm
             self.ee_p, self.ee_R = kin.fk(self.name, self.calib, q)
+            self.ee_v = np.zeros(3)
             return "limit"
         # an angle the joints can't reach: buzz, and keep the target, so the gripper turns again as soon as the hand
         # comes back to where the gripper stopped
-        return "limit" if res_r > math.radians(3) else None
+        return "limit" if res_r > math.radians(3) or slide_hit else None
 
     def grip(self, trigger, dt):
         g = self.calib.get("grip")
@@ -276,7 +335,8 @@ class Brain:
             if a.on and a.q_cmd is not None and a.epoch is not None:
                 self.to_loop({"t": "target", "arm": a.name, "epoch": a.epoch,
                               "q": [round(float(v), 5) for v in a.q_cmd],
-                              "g": None if a.g_cmd is None else round(float(a.g_cmd), 5)})
+                              "g": None if a.g_cmd is None else round(float(a.g_cmd), 5),
+                              "lead": FINE_LEAD if (a.fine or a.lock) else 1.0})
         self.last_send = time.monotonic()
 
     PATTERNS = {"fine": [[0.5, 40, 90], [0.5, 40, 0]], "align": [[0.8, 350, 0]],
@@ -396,6 +456,24 @@ class Brain:
                         a.engage(H["p"], H["q"], now)
                         a.want_resume = False
                         self.event("engage", arm=hand, E0=[round(v, 4) for v in a.anchor["E0p"]])
+            if a.engaged:
+                # thumbstick tilt: forward/back = in/out along the plug's axis, left/right = sideways; held down =
+                # insertion lock (the hand drives, along the axis only)
+                sx, sy = (float(v) for v in (H.get("stick") or [0, 0])[:2])
+                vmax = SLIDE_V_FINE if a.fine else SLIDE_V
+                tx, ty = (max(0.0, (abs(v) - SLIDE_DZ) / (1 - SLIDE_DZ)) for v in (sx, sy))
+                sliding = tx > 0 or ty > 0
+                a.slide_v = -math.copysign(ty * ty * vmax, sy)  # forward (y < 0) = in
+                a.slide_side = math.copysign(tx * tx * vmax, sx)  # right (x > 0) = the operator's right
+                want_lock = bool(b[2]) or sliding
+                if want_lock != (a.lock is not None) or sliding != a.sliding:
+                    a.sliding = sliding
+                    a.set_lock(want_lock)  # re-anchors: switching never jumps
+                    if sliding:
+                        self.say(f"{hand}: thumbstick jog (in/out along the plug, left/right sideways)")
+                    else:
+                        self.say(f"{hand}: insertion lock {'on: straight in/out only' if a.lock else 'off'}")
+                    await self.haptic(hand, "fine")
             if a.engaged:
                 lim_hit = a.drive(H["p"], H["q"], self.M, dt) == "limit"
                 if now - getattr(a, "trace_t", 0.0) > 0.1:  # 10 Hz trace: hand vs gripper (robot frame) + joints
@@ -635,7 +713,9 @@ def main():
     ap.add_argument("--tel-port", type=int, default=47002)
     ap.add_argument("--scale", type=float, default=1.0)
     ap.add_argument("--vmax", type=float, default=0.15, help="end-effector speed cap m/s")
-    ap.add_argument("--fine-vmax", type=float, default=0.08)
+    ap.add_argument("--fine-vmax", type=float, default=0.03, help="fine mode grasp-point speed cap m/s")
+    ap.add_argument("--amax", type=float, default=1.5, help="grasp-point acceleration limit m/s^2 (smooth follower)")
+    ap.add_argument("--fine-amax", type=float, default=0.3, help="same, fine mode")
     ap.add_argument("--wmax", type=float, default=2.0, help="end-effector rotation cap rad/s (the wrist joints' own top speed)")
     ap.add_argument("--jump", type=float, default=0.05, help="max target step per sample, m")
     ap.add_argument("--min-cutoff", type=float, default=2.0)

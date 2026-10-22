@@ -48,6 +48,8 @@ JUMP_GUARD = 0.5  # rad: a target this far from the follower is refused
 BACKOFF = math.radians(3)  # rad a strained joint is backed off its obstacle on a torque trip
 TEMP_HOLD, TEMP_PARK = 70, 80  # degC (max of MOSFET / rotor): hold, then park
 GOAL_V_DECAY_S = 0.04  # forget the target's velocity estimate when targets stop for this long
+LEAD_V_HZ = 4.0  # the velocity lead uses the follower's speed low-passed at this cutoff: small target dither
+# x a 180-350 ms lead was a +-1 deg J4 command wobble with a still hand
 ENABLE_HOLD_S, GRACE_CYCLES = 0.5, 10
 
 
@@ -82,6 +84,8 @@ class Arm:
         self.target_t, self.target_prev, self.brain_live = 0.0, None, False
         self.can_errors = 0
         self.err_max = [0.0] * n  # per joint, reset each stats second
+        self.err_dir = [0.0] * n  # that error, signed: - = behind the follower's motion (lag), + = ahead (overshoot)
+        self.v_lp, self.lead_scale, self.lead_want = [0.0] * n, 1.0, 1.0
         self.tau_prev, self.ripple_sum, self.ripple_n = [None] * n, [0.0] * n, 0  # buzz detector
         self.late = [0] * n  # replies that arrived after the reply timeout, per joint
         self.tx_full = 0  # sends refused because the bus is not acknowledging
@@ -100,7 +104,7 @@ class Arm:
         for j in JOINTS:
             if to_measured:
                 self.x[j] = self.pos[j]
-            self.v[j], self.goal[j], self.goal_v[j] = 0.0, self.x[j], 0.0
+            self.v[j], self.goal[j], self.goal_v[j], self.v_lp[j] = 0.0, self.x[j], 0.0, 0.0
         self.epoch += 1
         self.target_prev = None
 
@@ -152,11 +156,16 @@ class Arm:
             lead = GRIP_TORQUE / GRIP_KP
             p = clamp(self.x[8], self.pos[8] - lead, self.pos[8] + lead) if self.seen[8] else self.x[8]
             return 8, dm.mit(p, 0.0, GRIP_KP, GRIP_KD, 0.0, self.vmax_reg[8], self.tmax_reg[8])
-        speed = PARK_V if self.mode == "parking" else VMAX[j] * self.args.motor_speed_scale
+        speed = PARK_V if self.mode == "parking" else \
+            VMAX[j] * self.args.motor_speed_scale * (self.args.motor_speed_scale_34 if j in (3, 4) else 1.0)
         # the motors' own position loop trails its target like a ~0.14 s first-order lag (measured S2):
         # command ahead by speed x lag so the joint itself lands on the follower
         lead_ms = self.args.lead_list[j - 1] if self.args.lead_list else (self.args.lead_ms_34 if j in (3, 4) else self.args.lead_ms)
-        lead = self.v[j] * lead_ms / 1000 if self.mode in ("on", "parking", "hold", "fault") else 0.0
+        # lead on the smaller of the follower's speed and its 4 Hz low-pass (same sign only): dither averages out,
+        # and braking cuts the lead at once (a low-pass alone kept leading while stopping: 5 mm overshoot in the sim)
+        v, vl = self.v[j], self.v_lp[j]
+        v_lead = (min(v, vl) if v > 0 else max(v, vl)) if v * vl > 0 else 0.0
+        lead = v_lead * self.lead_scale * lead_ms / 1000 if self.mode in ("on", "parking", "hold", "fault") else 0.0
         return 0x100 + j, dm.posvel(self.x[j] + lead, speed)
 
     def exchange(self, timeout):
@@ -312,7 +321,8 @@ class Arm:
                 return self.set_fault(f"J{j} switched itself off", log)
             if j == 8:
                 continue
-            self.err_max[j] = max(self.err_max[j], abs(self.pos[j] - self.x[j]))
+            if abs(err := self.pos[j] - self.x[j]) > self.err_max[j]:
+                self.err_max[j], self.err_dir[j] = abs(err), err * (1.0 if self.v_lp[j] >= 0 else -1.0)
             if self.tau_prev[j] is not None:
                 self.ripple_sum[j] += (self.tau[j] - self.tau_prev[j]) ** 2
             self.tau_prev[j] = self.tau[j]
@@ -366,6 +376,8 @@ class Arm:
         for j in JOINTS:
             if j not in self.skip:
                 self.goal[j] = goal[j - 1]
+        lead = msg.get("lead", 1.0)
+        self.lead_want = clamp(float(lead), 0.0, 1.0) if isinstance(lead, (int, float)) and math.isfinite(lead) else 1.0
         if not self.brain_live:
             self.reason = "following the brain"
         self.target_prev, self.target_t, self.brain_live = goal, now, True
@@ -401,6 +413,10 @@ class Arm:
             if (g - xn) * e < 0:  # overshot: land on the goal
                 xn, v = g, vg
             self.x[j], self.v[j] = xn, v
+        a_lp = 1 - math.exp(-2 * math.pi * LEAD_V_HZ * dt)
+        for j in JOINTS:
+            self.v_lp[j] += a_lp * (self.v[j] - self.v_lp[j])
+        self.lead_scale += (1 - math.exp(-2 * math.pi * 2.0 * dt)) * (self.lead_want - self.lead_scale)
 
     def park_progress(self, now, log):
         if self.mode != "parking":
@@ -474,6 +490,21 @@ class Log:
         self.f.flush()
 
 
+def sim_only(argv):
+    """True if a motor_loop command line drives only vcan buses (defaults: --arms left,right, real can0/can1)."""
+    def opt(name, default):
+        for i, a in enumerate(argv):
+            if a == name and i + 1 < len(argv):
+                return argv[i + 1]
+            if a.startswith(name + "="):
+                return a.split("=", 1)[1]
+        return default
+    buses = dict(ARM_BUS)
+    buses.update(dict(kv.split("=", 1) for kv in opt("--buses", "").split(",") if "=" in kv))
+    arms = [n for n in opt("--arms", "left,right").split(",") if n]
+    return bool(arms) and all(buses.get(n, "").startswith("vcan") for n in arms)
+
+
 def find_other_writer():
     for pid in os.listdir("/proc"):
         if pid.isdigit() and int(pid) != os.getpid():
@@ -485,6 +516,8 @@ def find_other_writer():
             if not os.path.basename(argv[0]).startswith("python"):
                 continue  # shells and sudo merely mention the name
             if any(a.endswith(("teleop_web.py", "motor_loop.py")) for a in argv[1:3]):
+                if sim_only(argv):
+                    continue  # a simulator run: every arm it drives is on a virtual (vcan) bus
                 return pid, " ".join(argv).strip()
     return None
 
@@ -523,6 +556,8 @@ def main():
     ap.add_argument("--lead-ms", type=float, default=180, help="velocity lead to cancel the motors' position-loop lag")
     ap.add_argument("--lead-ms-34", type=float, default=350, help="same, for the DM4340 joints J3/J4")
     ap.add_argument("--motor-speed-scale", type=float, default=1.0, help="x the follower vmax, sent as the posvel speed limit")
+    ap.add_argument("--motor-speed-scale-34", type=float, default=1.0,
+                    help="extra x for J3/J4 only: posvel speed headroom so the sluggish DM4340s can catch up (test 1.5)")
     ap.add_argument("--park-timeout", type=float, default=30)
     ap.add_argument("--read-only", action="store_true", help="never enable; print angles once a second")
     ap.add_argument("--test", choices=["none", "hold", "sine", "probe"], default="none")
@@ -790,12 +825,13 @@ def stats(args, arms, periods, works, late, overruns, log, span, t_start):
            "arms": {a.name: {"mode": a.mode, "misses": a.misses[1:], "late": a.late[1:], "gaps": len(a.gaps), "can_errors": a.can_errors,
                              "max_err_deg": round(math.degrees(max(a.err_max[1:8])), 2),
                              "err_deg": [round(math.degrees(e), 2) for e in a.err_max[1:8]],
+                             "err_dir_deg": [round(math.degrees(e), 2) for e in a.err_dir[1:8]],
                              "ripple": [round(math.sqrt(a.ripple_sum[j] / a.ripple_n), 3) if a.ripple_n else 0.0 for j in range(1, 8)],
                              "max_tau": [round(a.tau[j], 1) for j in JOINTS],
                              "temp": a.temp[1:]} for a in arms}}
     log.event("stats", **rec)
     for a in arms:
-        a.err_max = [0.0] * 9
+        a.err_max, a.err_dir = [0.0] * 9, [0.0] * 9
         a.ripple_sum, a.ripple_n = [0.0] * 9, 0
     log.flush()
     parts = [f"{rec['hz']:6.1f} Hz", f"p99 {rec['p99_period_ms']:.2f} ms", f"max {rec['max_period_ms']:.2f}",

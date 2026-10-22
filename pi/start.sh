@@ -4,7 +4,7 @@
 # 1. stops old copies (arms park first), 2. resets both CAN buses (needed after any arm power unplug),
 # 3. starts the motor loop (the arms switch on and hold where they are),
 # 4. starts the server (https :8443 for Wi-Fi, http :8080 for the USB cable), 5. sets up the USB link
-# (adb reverse) and opens the teleop page in the headset if it is plugged in.
+# (adb reverse) and, if the headset is plugged in and no teleop page reconnects by itself, opens the page.
 cd "$(dirname "$0")/.." || exit 1
 ARMS="${1:-left,right}"
 
@@ -28,7 +28,16 @@ sudo adb start-server >/dev/null 2>&1
 timeout 5 adb wait-for-device 2>/dev/null  # the server needs a moment to find the headset
 if adb devices | grep -q "device$"; then
   adb reverse tcp:8080 tcp:8080 && echo "  headset on USB: open http://localhost:8080"
-  adb shell am start -a android.intent.action.VIEW -d http://localhost:8080 com.oculus.browser >/dev/null 2>&1
+  # an open teleop page reconnects by itself (it retries every 1 s): open the page only if none does. Launching the
+  # browser again while the headset switches in/out of AR made it hang ("isn't responding", 2026-10-21 16:03)
+  i=0
+  while ! grep -q "page connected" /tmp/brain.log && [ $i -lt 6 ]; do sleep 1; i=$((i + 1)); done
+  if grep -q "page connected" /tmp/brain.log; then
+    echo "  the teleop page in the headset reconnected by itself"
+  else
+    adb shell am start -a android.intent.action.VIEW -d http://localhost:8080 com.oculus.browser >/dev/null 2>&1
+    echo "  opened the teleop page in the headset"
+  fi
 else
   echo "  headset not on USB (or not allowed): use https://$(ip -4 -br addr show eth0 | awk '{print $3}' | cut -d/ -f1):8443"
 fi
