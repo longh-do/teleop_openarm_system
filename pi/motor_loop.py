@@ -124,14 +124,17 @@ class Arm:
         """Motor-side tuning in RAM (S8): the factory position gain KP_APR=54 and ACC/DEC=2 make the joints trail a
         streamed target by ~150 ms; others run KP_APR 200-400, ACC 10-50. Written with the motors off, at start and
         at every power-on (an arm power cycle resets RAM). Never saved to flash."""
-        g = self.args.gains
+        g = self.args.gains.get(self.name)
         if not g:
             return
         got = {}
         for j in range(1, 8):
             if j in self.skip:
                 continue
-            want = {dm.RID_KP_APR: g["kp_apr"][j - 1], dm.RID_ACC: g["acc"], dm.RID_DEC: -abs(g["acc"])}
+            kp, acc = g["kp_apr"][j - 1], g["acc"][j - 1]  # None: leave that motor's value alone
+            want = {} if kp is None else {dm.RID_KP_APR: kp}
+            if acc is not None:
+                want.update({dm.RID_ACC: acc, dm.RID_DEC: -abs(acc)})
             for rid, val in want.items():
                 back = dm.write_register(self.sock, j, rid, float(val))
                 got.setdefault(j, []).append(None if back is None else round(back, 2))
@@ -150,7 +153,12 @@ class Arm:
                     table[j] = v
                 else:
                     log.event("register_unread", arm=self.name, joint=j, rid=rid)
-        log.event("registers", arm=self.name, vmax=self.vmax_reg, tmax=self.tmax_reg)
+        tune = {}  # the posvel loop's own settings, as they are in the motors' RAM right now (logged, never written here)
+        for j in range(1, 8):
+            if j not in getattr(self, "skip", ()):
+                tune[j] = [None if v is None else round(v, 2) for v in
+                           (dm.read_register(self.sock, j, rid) for rid in (dm.RID_KP_APR, dm.RID_ACC, dm.RID_DEC))]
+        log.event("registers", arm=self.name, vmax=self.vmax_reg, tmax=self.tmax_reg, kp_apr_acc_dec=tune)
 
     def frame_for(self, j):
         if self.mode in ("off", "starting_read"):
@@ -165,7 +173,8 @@ class Arm:
             VMAX[j] * self.args.motor_speed_scale * (self.args.motor_speed_scale_34 if j in (3, 4) else 1.0)
         # the motors' own position loop trails its target like a ~0.14 s first-order lag (measured S2):
         # command ahead by speed x lag so the joint itself lands on the follower
-        lead_ms = self.args.lead_list[j - 1] if self.args.lead_list else (self.args.lead_ms_34 if j in (3, 4) else self.args.lead_ms)
+        ll = self.args.lead_list.get(self.name)
+        lead_ms = ll[j - 1] if ll else (self.args.lead_ms_34 if j in (3, 4) else self.args.lead_ms)
         # lead on the smaller of the follower's speed and its 4 Hz low-pass (same sign only): dither averages out,
         # and braking cuts the lead at once (a low-pass alone kept leading while stopping: 5 mm overshoot in the sim)
         v, vl = self.v[j], self.v_lp[j]
@@ -584,19 +593,30 @@ def main():
     args = ap.parse_args()
 
     ARM_BUS.update(dict(kv.split("=") for kv in args.buses.split(",")))
-    args.gains, args.lead_list = None, None
+    args.gains, args.lead_list = {}, {}  # per arm name
     if os.path.exists(args.gains_file):
         with open(args.gains_file) as f:
             gf = json.load(f)
-        args.gains = {"kp_apr": [float(v) for v in gf["kp_apr"]], "acc": float(gf["acc"])}
-        args.lead_list = [float(v) for v in gf["lead_ms"]] if "lead_ms" in gf else None
+        # {"right": {...}, "left": {...}} or one {...} for both arms. Per joint: null = leave that motor alone;
+        # "acc" may also be one number for all seven
+        for arm_name in ("right", "left"):
+            g = gf.get(arm_name) if any(k in gf for k in ("right", "left")) else gf
+            if not g:
+                continue
+            acc = g.get("acc", [None] * 7)
+            acc = acc if isinstance(acc, list) else [acc] * 7
+            args.gains[arm_name] = {"kp_apr": [None if v is None else float(v) for v in g.get("kp_apr", [None] * 7)],
+                                    "acc": [None if v is None else float(v) for v in acc]}
+            if "lead_ms" in g:
+                args.lead_list[arm_name] = [float(v) for v in g["lead_ms"]]
     seven = lambda txt: [float(v) for v in txt.split(",")] * (7 if "," not in txt else 1)  # noqa: E731
     if args.kp_apr or args.acc is not None:
-        base = args.gains or {"kp_apr": [54.0] * 7, "acc": 2.0}
-        args.gains = {"kp_apr": seven(args.kp_apr) if args.kp_apr else base["kp_apr"],
-                      "acc": args.acc if args.acc is not None else base["acc"]}
+        for arm_name in ("right", "left"):
+            base = args.gains.get(arm_name) or {"kp_apr": [54.0] * 7, "acc": [2.0] * 7}
+            args.gains[arm_name] = {"kp_apr": seven(args.kp_apr) if args.kp_apr else base["kp_apr"],
+                                    "acc": [args.acc] * 7 if args.acc is not None else base["acc"]}
     if args.lead:
-        args.lead_list = seven(args.lead)
+        args.lead_list = {arm_name: seven(args.lead) for arm_name in ("right", "left")}
     names = [a.strip() for a in args.arms.split(",") if a.strip()]
     assert all(n in ARM_BUS for n in names), f"--arms must be from {list(ARM_BUS)}"
     other = None if all(ARM_BUS[n].startswith("vcan") for n in names) else find_other_writer()

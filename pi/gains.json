@@ -1,0 +1,61 @@
+{
+ "_note": "Written to the motors' RAM at every start and power-on (never to flash). J3/J4 (DM4340) only: KP_APR 54 -> 250 cut their own lag 450 -> 140 ms with no shaking (tools/tune_elbow.py, 2026-10-22, both arms); lead_ms J3/J4 = that lag. null = leave the motor's value alone. Never raise J1/J2 (DM8009): KP 150 made the left shoulders shake on 2026-10-21.",
+ "right": {
+  "kp_apr": [
+   null,
+   null,
+   250.0,
+   250.0,
+   null,
+   null,
+   null
+  ],
+  "acc": [
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   null
+  ],
+  "lead_ms": [
+   180.0,
+   180.0,
+   140.0,
+   140.0,
+   180.0,
+   180.0,
+   180.0
+  ]
+ },
+ "left": {
+  "kp_apr": [
+   null,
+   null,
+   250.0,
+   250.0,
+   null,
+   null,
+   null
+  ],
+  "acc": [
+   null,
+   null,
+   null,
+   null,
+   null,
+   null,
+   null
+  ],
+  "lead_ms": [
+   180.0,
+   180.0,
+   140.0,
+   140.0,
+   180.0,
+   180.0,
+   180.0
+  ]
+ }
+}
