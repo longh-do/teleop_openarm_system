@@ -81,9 +81,12 @@ def main():
         if j == 1 and now < drop_until or j == args.dead:
             continue
         tau = 0.5 * math.sin(now) if on[j] else 0.0
-        if on[j] and j in stops:  # pressing an end stop: torque grows with how far the command is past it
-            lo, hi = stops[j]
-            tau += args.stop_k * (max(tgt[j] - hi, 0.0) + min(tgt[j] - lo, 0.0))
+        if on[j] and j in stops:  # pressing an end stop (only once the joint is at it): torque grows with how far the
+            lo, hi = stops[j]      # command is past it
+            if pos[j] >= hi - 1e-4:
+                tau += args.stop_k * max(tgt[j] - hi, 0.0)
+            elif pos[j] <= lo + 1e-4:
+                tau += args.stop_k * min(tgt[j] - lo, 0.0)
         s.send(struct.pack(dm.FRAME, 0x10 + j, 8, encode_reply(j, int(on[j]), pos[j], vel[j], tau, dm.VMAX[j], dm.TMAX[j])))
 
 

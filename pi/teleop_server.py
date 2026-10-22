@@ -51,7 +51,7 @@ XR_TIMEOUT = 0.15  # s without controller data -> disengage
 # direction but further down works; the IK bends the elbow for "up".
 # joint speed the motor loop's follower allows (motor_loop VMAX); IK steps are kept under 90% of it, so the brain
 # never asks for a jump the loop would refuse (19:36: from the straight-down pose the IK asked J4 for 29 deg at once)
-LOOP_VMAX = np.array([1.0, 1.0, 0.6, 0.6, 2.0, 2.0, 2.0])
+LOOP_VMAX = np.array([1.0, 1.0, 0.9, 0.9, 2.0, 2.0, 2.0])
 # gripper command speed, rad/s (--grip-rate): 2026-10-22 slowed from 3.0 (a full close took 0.35 s) to 1.2 (0.9 s), so
 # the squeeze on a held object can be set finely with the trigger
 GRIP_CATCH = 0.05  # rad: after a squeeze the gripper waits until the trigger comes this close to its current opening
@@ -741,9 +741,10 @@ def main():
     ap.add_argument("--loop-port", type=int, default=47001)
     ap.add_argument("--tel-port", type=int, default=47002)
     ap.add_argument("--scale", type=float, default=1.0)
-    ap.add_argument("--vmax", type=float, default=0.15, help="end-effector speed cap m/s")
+    # 2026-10-22 (user: "still moving quite slowly", trailing ~100 ms): 0.15 -> 0.35 m/s, 1.5 -> 4 m/s^2, rotation 4 -> 6 Hz
+    ap.add_argument("--vmax", type=float, default=0.35, help="end-effector speed cap m/s")
     ap.add_argument("--fine-vmax", type=float, default=0.06, help="fine mode grasp-point speed cap m/s")
-    ap.add_argument("--amax", type=float, default=1.5, help="grasp-point acceleration limit m/s^2 (smooth follower)")
+    ap.add_argument("--amax", type=float, default=4.0, help="grasp-point acceleration limit m/s^2 (smooth follower)")
     ap.add_argument("--fine-amax", type=float, default=0.8, help="same, fine mode")
     ap.add_argument("--wmax", type=float, default=2.0, help="end-effector rotation cap rad/s (the wrist joints' own top speed)")
     ap.add_argument("--jump", type=float, default=0.05, help="max target step per sample, m")
@@ -754,7 +755,7 @@ def main():
     # ~80 ms delay at every speed; 20 keeps the same still-hand steadiness with 11-22 ms delay (measured on the Pi)
     ap.add_argument("--beta", type=float, default=20.0)
     ap.add_argument("--d-cutoff", type=float, default=1.5)
-    ap.add_argument("--rot-cutoff", type=float, default=4.0, help="Hz, orientation SLERP smoothing")
+    ap.add_argument("--rot-cutoff", type=float, default=6.0, help="Hz, orientation SLERP smoothing")
     ap.add_argument("--ik", choices=["position", "pose"], default="pose",
                     help="pose: the gripper follows the hand's position and angle (default); position: position only")
     ap.add_argument("--rot-scale", type=float, default=1.0, help="1 = the gripper turns as much as the hand (default)")

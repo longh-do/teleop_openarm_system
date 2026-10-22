@@ -30,6 +30,10 @@
       "6": [
         -29.0,
         30.0
+      ],
+      "4": [
+        0.0,
+        130.0
       ]
     },
     "grip": {
@@ -37,7 +41,7 @@
       "closed": -0.52
     },
     "verified": true,
-    "notes": "S1 2026-10-20: model zero = arms hanging straight (photos). offset = minus the hanging rest angle, except J5 hangs a quarter turn from the model: offset = 90 - rest. Probes (user watched): J1+ fwd, J2+ out, J4+ fwd, J6+ hand in, J7- hand back, J8- closes; elbow 30 deg + J3+ forearm out; hand back 35 deg + J5+ hand in. All match sign +1. J5 limited to rest +-70 deg. Gripper stops +0.592 (open) / -0.556 (closed), 0.03 margin. S5 17:16: J7 pressed its real end stop (model allows +-90) -> J6/J7 limited to model +-40 deg. S5 17:28: J6 lost comms whenever J5 twisted ~36 deg from rest (cable strain) -> J5 limited to rest +-25 deg. 2026-10-21: user: never narrow the joints. J5 = its full designed travel; J6 +-45 and J7 +-90 = the model's design range, until tools/find_stops.py measures the real end stops. (The J6 dropout blamed on J5 twist also happened once at rest with the motors off, so the cable cause is not proven.) 2026-10-21 15:45 first find_stops run (single-sample stops): J7 -45.2/+68.9, J6 -33.0/+30.1, J5 low end +12.3; both forearms met a real end at motor -91.5 deg, so J5's range is the model's +-90 about the MOTOR's zero, not the hanging rest. 2026-10-21 16:06 find_stops: J5 +13.5..+191.0, J6 -29.0..+30.0, J7 -43.5..+67.5."
+    "notes": "S1 2026-10-20: model zero = arms hanging straight (photos). offset = minus the hanging rest angle, except J5 hangs a quarter turn from the model: offset = 90 - rest. Probes (user watched): J1+ fwd, J2+ out, J4+ fwd, J6+ hand in, J7- hand back, J8- closes; elbow 30 deg + J3+ forearm out; hand back 35 deg + J5+ hand in. All match sign +1. J5 limited to rest +-70 deg. Gripper stops +0.592 (open) / -0.556 (closed), 0.03 margin. S5 17:16: J7 pressed its real end stop (model allows +-90) -> J6/J7 limited to model +-40 deg. S5 17:28: J6 lost comms whenever J5 twisted ~36 deg from rest (cable strain) -> J5 limited to rest +-25 deg. 2026-10-21: user: never narrow the joints. J5 = its full designed travel; J6 +-45 and J7 +-90 = the model's design range, until tools/find_stops.py measures the real end stops. (The J6 dropout blamed on J5 twist also happened once at rest with the motors off, so the cable cause is not proven.) 2026-10-21 15:45 first find_stops run (single-sample stops): J7 -45.2/+68.9, J6 -33.0/+30.1, J5 low end +12.3; both forearms met a real end at motor -91.5 deg, so J5's range is the model's +-90 about the MOTOR's zero, not the hanging rest. 2026-10-21 16:06 find_stops: J5 +13.5..+191.0, J6 -29.0..+30.0, J7 -43.5..+67.5. 2026-10-22: J4 (elbow) ends at 130: the right elbow's real fold stop is ~132.4 deg (median of 44 torque pauses at commanded 134-138 on 2026-10-22, measured = commanded + tracking error); the left is assumed the same (mirror build, never driven past 119)."
   },
   "left": {
     "sign": [
@@ -70,6 +74,10 @@
       "6": [
         -45.0,
         31.5
+      ],
+      "4": [
+        0.0,
+        130.0
       ]
     },
     "grip": {
@@ -77,6 +85,6 @@
       "closed": -0.54
     },
     "verified": true,
-    "notes": "S1 2026-10-20: rest read 15:49 (motors off): -70.1 -4.8 -10.9 -40.2 -19.9 +6.0 -4.8. J5 hangs a quarter turn the OTHER way from the right arm (mirror): offset = -90 - rest. Probes (user watched): J1+ back, J2- out, J4+ fwd, J6+ hand OUT, J7- hand FORWARD, J8- closes; elbow 30 + J3+ forearm in; hand tilted 35 + J5+ hand in. All match sign +1 with J5 at -90. J5 limited to rest +-70 deg. Gripper stops +0.527 (open) / -0.569 (closed). S5 17:16: J7 pressed its real end stop (model allows +-90) -> J6/J7 limited to model +-40 deg. S5 17:28: J6 lost comms whenever J5 twisted ~36 deg from rest (cable strain) -> J5 limited to rest +-25 deg. 2026-10-21: user: never narrow the joints. J5 = its full designed travel; J6 +-45 and J7 +-90 = the model's design range, until tools/find_stops.py measures the real end stops. (The J6 dropout blamed on J5 twist also happened once at rest with the motors off, so the cable cause is not proven.) 2026-10-21 15:45 first find_stops run (single-sample stops): J7 -70.7/+78.8, J6 +33.2 (-45 free), J5 low end -161.8; both forearms met a real end at motor -91.5 deg, so J5's range is the model's +-90 about the MOTOR's zero, not the hanging rest. 2026-10-21 16:06 find_stops: J5 -160.0..+16.5, J6 -45.0..+31.5, J7 -69.0..+77.0."
+    "notes": "S1 2026-10-20: rest read 15:49 (motors off): -70.1 -4.8 -10.9 -40.2 -19.9 +6.0 -4.8. J5 hangs a quarter turn the OTHER way from the right arm (mirror): offset = -90 - rest. Probes (user watched): J1+ back, J2- out, J4+ fwd, J6+ hand OUT, J7- hand FORWARD, J8- closes; elbow 30 + J3+ forearm in; hand tilted 35 + J5+ hand in. All match sign +1 with J5 at -90. J5 limited to rest +-70 deg. Gripper stops +0.527 (open) / -0.569 (closed). S5 17:16: J7 pressed its real end stop (model allows +-90) -> J6/J7 limited to model +-40 deg. S5 17:28: J6 lost comms whenever J5 twisted ~36 deg from rest (cable strain) -> J5 limited to rest +-25 deg. 2026-10-21: user: never narrow the joints. J5 = its full designed travel; J6 +-45 and J7 +-90 = the model's design range, until tools/find_stops.py measures the real end stops. (The J6 dropout blamed on J5 twist also happened once at rest with the motors off, so the cable cause is not proven.) 2026-10-21 15:45 first find_stops run (single-sample stops): J7 -70.7/+78.8, J6 +33.2 (-45 free), J5 low end -161.8; both forearms met a real end at motor -91.5 deg, so J5's range is the model's +-90 about the MOTOR's zero, not the hanging rest. 2026-10-21 16:06 find_stops: J5 -160.0..+16.5, J6 -45.0..+31.5, J7 -69.0..+77.0. 2026-10-22: J4 (elbow) ends at 130: the right elbow's real fold stop is ~132.4 deg (median of 44 torque pauses at commanded 134-138 on 2026-10-22, measured = commanded + tracking error); the left is assumed the same (mirror build, never driven past 119)."
   }
 }

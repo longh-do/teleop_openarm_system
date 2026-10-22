@@ -38,8 +38,9 @@ ARM_BUS = {"right": "can0", "left": "can1"}
 JOINTS = range(1, 9)
 # follower speed / acceleration limits. The DM4340 joints (J3, J4) follow their own position loop sluggishly
 # (S1: J4 fell 8.6 deg behind at 0.6 rad/s with only 2.8 Nm load), so they get lower limits
-VMAX = {1: 1.0, 2: 1.0, 3: 0.6, 4: 0.6, 5: 2.0, 6: 2.0, 7: 2.0, 8: 3.0}  # rad/s
-AMAX = {1: 4.0, 2: 4.0, 3: 3.0, 4: 3.0, 5: 4.0, 6: 4.0, 7: 4.0, 8: 12.0}  # rad/s^2
+# 2026-10-22: J3/J4 0.6 -> 0.9 rad/s, 3 -> 4 rad/s^2 (the user felt the arm trailing; the lead now covers their lag)
+VMAX = {1: 1.0, 2: 1.0, 3: 0.9, 4: 0.9, 5: 2.0, 6: 2.0, 7: 2.0, 8: 3.0}  # rad/s
+AMAX = {1: 4.0, 2: 4.0, 3: 4.0, 4: 4.0, 5: 4.0, 6: 4.0, 7: 4.0, 8: 12.0}  # rad/s^2
 PARK_V, PARK_A = 0.3, 1.0
 # Nm, sustained -> hold. Raised 2026-10-22 (was 15/15/10/10/4/4/4): pushing a plug into the adapter needs a firm push,
 # and the lower values paused the arm halfway (the user accepts the stronger pushes)
@@ -559,7 +560,9 @@ def main():
     ap.add_argument("--lead", default="", help="override velocity lead ms: one value or 7 comma-separated (tests)")
     ap.add_argument("--lead-ms", type=float, default=180, help="velocity lead to cancel the motors' position-loop lag")
     ap.add_argument("--lead-ms-34", type=float, default=350, help="same, for the DM4340 joints J3/J4")
-    ap.add_argument("--motor-speed-scale", type=float, default=1.0, help="x the follower vmax, sent as the posvel speed limit")
+    # 2.0 (was 1.0): the posvel speed limit capped a joint that fell behind at exactly the follower's speed, so it could
+    # never catch up while moving (J3/J4 trailed 2-4 deg, 2026-10-22); a per-frame field, not a motor register
+    ap.add_argument("--motor-speed-scale", type=float, default=2.0, help="x the follower vmax, sent as the posvel speed limit")
     ap.add_argument("--motor-speed-scale-34", type=float, default=1.0,
                     help="extra x for J3/J4 only: posvel speed headroom so the sluggish DM4340s can catch up (test 1.5)")
     ap.add_argument("--grip-torque", type=float, default=GRIP_TORQUE, help="Nm: the grippers' strongest squeeze")
