@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Debug the teleop page inside the Quest browser from the laptop (Quest on USB, developer mode, USB debugging allowed).
+"""Debug the teleop page inside the Quest browser from a computer (Quest on USB, developer mode, USB debugging allowed).
+Finds the page served on :8443 (HTTPS, Wi-Fi) or :8080 (plain HTTP over the USB cable, as pi/start.sh sets up).
   adb forward tcp:9222 localabstract:chrome_devtools_remote
   python3 tools/quest_cdp.py eval "navigator.userAgent"
   python3 tools/quest_cdp.py watch 60        # print the page's console + errors for 60 s
@@ -15,12 +16,14 @@ async def page_ws(s):
     async with s.get("http://localhost:9222/json") as r:
         pages = await r.json()
     for p in pages:
-        if p["type"] == "page" and ":8443" in p["url"]:
+        if p["type"] == "page" and any(port in p["url"] for port in (":8443", ":8080")):
             return p["webSocketDebuggerUrl"]
     sys.exit(f"teleop page not open in the Quest browser: {[p['url'] for p in pages]}")
 
 
 async def main():
+    if len(sys.argv) < 3 or sys.argv[1] not in ("eval", "watch"):
+        sys.exit(__doc__)
     mode = sys.argv[1]
     async with aiohttp.ClientSession() as s:
         url = await page_ws(s)

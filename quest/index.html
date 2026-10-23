@@ -61,7 +61,7 @@
     <li><b>Hold GRIP</b> = drive that arm (release = freeze). The gripper copies where your hand is <b>and how it is turned</b>: hold the controller the way the gripper points</li>
     <li><b>TRIGGER</b> (while holding grip) = close gripper. After you grab again, the gripper waits until the trigger reaches its current opening, so a held object stays held</li>
     <li><b>B</b> = align (stand beside the robot facing its way, point right controller straight ahead)</li>
-    <li><b>A / X</b> = fine mode: moves and turns 2x smaller (up to 6 cm/s), for lining up a plug</li>
+    <li><b>A / X</b> = fine mode: moves and turns 2x smaller (up to 6 cm/s), for precise moves</li>
     <li><b>Hold thumbstick down while driving</b> = insertion lock: the gripper only slides straight in/out along its pointing direction, angle frozen</li>
     <li><b>Hold RIGHT thumbstick 1 s</b> (arms off) = switch arms on</li>
     <li><b>Y</b> = STOP (arms lower and switch off)</li>
@@ -142,11 +142,10 @@ function connect() {
     let m;
     try { m = JSON.parse(ev.data); } catch (e) { return; }
     if (m.t === 'status') renderStatus(m);
-    else if (m.t === 'haptic') {
-      // pattern = [[intensity, ms, gap_ms], ...] so each event feels different; plain {i, ms} = one pulse
-      const steps = Array.isArray(m.pattern) ? m.pattern : [[+m.i || 0, +m.ms || 0, 0]];
+    else if (m.t === 'haptic' && Array.isArray(m.pattern)) {
+      // pattern = [[intensity, ms, gap_ms], ...] so each event feels different
       let at = 0;
-      for (const [i, ms, gap] of steps) { setTimeout(() => pulse(m.hand, i, ms), at); at += ms + (gap || 0); }
+      for (const [i, ms, gap] of m.pattern) { setTimeout(() => pulse(m.hand, i, ms), at); at += ms + (gap || 0); }
     }
   };
 }
@@ -239,7 +238,7 @@ function pulse(hand, i, ms) {
 // ---------------- WebXR ----------------
 let xrMode = null, session = null, refSpace = null, gl = null, targetRate = null;
 const clutch = { left: false, right: false };    // local Schmitt-trigger clutch (feedback only)
-let seq = 0, skipped = 0, sentCount = 0;
+let skipped = 0, sentCount = 0;
 let fps = 0, fpsFrames = 0, fpsT0 = 0;
 let xrStartSent = false;                         // has the server been told about this AR session?
 
@@ -274,7 +273,7 @@ $('start').addEventListener('click', () => {
 const isController = src => !!src.gamepad && !src.hand && src.gamepad.axes.length >= 4 &&
   (src.handedness === 'left' || src.handedness === 'right') && !src.profiles.some(p => p.includes('hand'));
 const t0 = performance.now();
-function xrlog(...a) {   // also readable from the laptop over adb + devtools (tools/quest_cdp.py watch)
+function xrlog(...a) {   // the console copy is readable over USB DevTools (tools/quest_cdp.py watch)
   const line = ((performance.now() - t0) / 1000).toFixed(1) + 's ' + a.join(' ');
   console.log(line);
   $('xrLog').textContent = (line + '\n' + $('xrLog').textContent).slice(0, 1500);
@@ -301,7 +300,7 @@ async function onSessionStarted(s) {
   }
   sendXrStart();          // the server asks for a fresh alignment in each AR session
   hudSetup();             // a failure here only loses the guide panel, never the session
-  hudPose.fresh = true;   // the panel starts straight in front of the eyes
+  hudPose.fresh = true;   // the first frame places the panel at once, without easing
   hudDrawn = false;
   setFrameRate(s);
   fps = 0; fpsFrames = 0; fpsT0 = 0;
@@ -386,9 +385,7 @@ function onXRFrame(t, frame) {
     if (t - fpsT0 >= 1000) { fps = fpsFrames * 1000 / (t - fpsT0); fpsFrames = 0; fpsT0 = t; }
 
     const vp = frame.getViewerPose(refSpace);
-    const head = vp ? poseOut(vp.transform) : null;
 
-    // Controllers: only left/right sources that have a gamepad.
     const hands = { left: null, right: null };
     const seen = {};
     for (let k = 0; k < s.inputSources.length; k++) {
@@ -402,7 +399,8 @@ function onXRFrame(t, frame) {
     }
     sources = seen;
 
-    // Local clutch (engage > 0.7, release < 0.3) with a haptic tick on each change; the chip says DRIVING at once.
+    // Local clutch (the server's thresholds: engage > 0.7, release < 0.3) with a haptic tick on each change; the chip
+    // says DRIVING at once.
     for (const h of HANDS) {
       const H = hands[h];
       if (!H) continue;
@@ -414,8 +412,7 @@ function onXRFrame(t, frame) {
     if (wsOpen()) {
       if (ws.bufferedAmount > 0) skipped++;
       else {
-        ws.send(JSON.stringify({ t: 'xr', seq: ++seq, ts: r5(performance.now()),
-          fps: Math.round(fps * 10) / 10, head, hands }));
+        ws.send(JSON.stringify({ t: 'xr', ts: r5(performance.now()), fps: Math.round(fps * 10) / 10, hands }));
         sentCount++;
       }
     }
@@ -429,8 +426,7 @@ function onXRFrame(t, frame) {
 
 // ---------------- Guide panel in the headset: text on a 2D canvas -> texture -> one quad per eye ----------------
 const HUD_W = 1024, HUD_H = 512;                       // canvas pixels
-// 2026-10-22: above eye level (HUD_DROP < 0 = up, ~20 deg) and smaller, so it never covers the table and the arms you
-// look down at while driving; glance up to read it. It was 0.3 m below eye level, right in the work area.
+// The panel hangs about 20 deg above eye level (HUD_DROP < 0 = above), clear of the workspace below; glance up to read it.
 const HUD_SIZE = [0.40, 0.20], HUD_DIST = 1.2, HUD_DROP = -0.45, HUD_FOLLOW = 0.1;   // metres; easing per frame
 const HUD_TILT = Math.atan2(HUD_DROP, HUD_DIST);      // lean so the panel faces the eyes
 const HUD_FONT = 'system-ui, Roboto, sans-serif';
@@ -526,7 +522,7 @@ function followHead(tf) {
   }
   hudPose.x += k * (p.x - hudPose.x); hudPose.y += k * (p.y - hudPose.y); hudPose.z += k * (p.z - hudPose.z);
   const s = Math.sin(hudPose.yaw), c = Math.cos(hudPose.yaw), st = Math.sin(HUD_TILT), ct = Math.cos(HUD_TILT);
-  // column-major: panel right, panel up (leaning back), panel normal (towards the eyes), centre
+  // column-major: panel right, panel up and panel normal (both tilted by HUD_TILT to face the eyes), centre
   hudModel.set([c, 0, -s, 0, -s * st, ct, -c * st, 0, s * ct, st, c * ct, 0,
                 hudPose.x - s * HUD_DIST, hudPose.y - HUD_DROP, hudPose.z - c * HUD_DIST, 1]);
 }

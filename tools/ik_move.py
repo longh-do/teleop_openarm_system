@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Calibration check without the headset: move one arm's grasp point along a straight line through the motor
 loop, hold, and come back. If signs/zeros are right the gripper moves exactly the asked distance and direction.
-  (motor_loop.py running in teleop mode, teleop_server.py NOT running)
+  (motor_loop.py running with the arm on; teleop_server.py stopped: one program sends targets)
   .venv/bin/python tools/ik_move.py left --dx 0.08          # 8 cm forward, hold 3 s, back
 Rig frame: x forward, y left, z up.
 """
@@ -20,8 +20,8 @@ import kinematics as kin  # noqa: E402
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("arm")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("arm", choices=("left", "right"))
     ap.add_argument("--dx", type=float, default=0.0)
     ap.add_argument("--dy", type=float, default=0.0)
     ap.add_argument("--dz", type=float, default=0.0)
@@ -31,9 +31,17 @@ def main():
     ap.add_argument("--pre", default="", help="joint:motor-degrees offsets to reach a working pose first (joint space)")
     ap.add_argument("--moves", default="", help="several moves in one run, e.g. x:0.08,z:0.08,y:-0.08 (from the working pose)")
     a = ap.parse_args()
+    steps = []  # --moves, parsed before anything moves
+    if a.moves:
+        axes = {"x": 0, "y": 1, "z": 2}
+        for item in a.moves.split(","):
+            k, v = item.split(":")
+            d = np.zeros(3)
+            d[axes[k]] = float(v)
+            steps.append(d)
     c = kin.load_calib()[a.arm]
     tel = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    tel.bind(("127.0.0.1", 47002))  # fails if teleop_server is running: one brain at a time
+    tel.bind(("127.0.0.1", 47002))  # busy while teleop_server.py runs (one program sends targets at a time)
     tel.settimeout(1.0)
     out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -47,7 +55,12 @@ def main():
             pass
         tel.settimeout(1.0)
         if m is None:
-            m = json.loads(tel.recv(65536))
+            try:
+                m = json.loads(tel.recv(65536))
+            except TimeoutError:
+                sys.exit("no telemetry from the motor loop: is it running?")
+        if a.arm not in m["arms"]:
+            sys.exit(f"the motor loop is not driving the {a.arm} arm")
         return m["arms"][a.arm]
 
     t = latest()
@@ -90,13 +103,6 @@ def main():
                 sys.exit(f"arm stopped while going to the working pose: {latest()['reason']}")
         q0 = q0 + pre
     if a.moves:
-        axes = {"x": 0, "y": 1, "z": 2}
-        steps = []
-        for item in a.moves.split(","):
-            k, v = item.split(":")
-            d = np.zeros(3)
-            d[axes[k]] = float(v)
-            steps.append(d)
         for d in steps:
             moved = do_move(a, c, q0, d, send, latest)
             if moved is None:
@@ -124,16 +130,14 @@ def main():
         while (s := (time.monotonic() - t0) / dur) < 1.0:
             k = (1 - np.cos(np.pi * s)) / 2
             q, _, _ = kin.ik(a.arm, c, frm[0] + (to - frm[0]) * k, R0, q)
-            out.sendto(json.dumps({"t": "target", "arm": a.arm, "epoch": epoch, "q": [float(v) for v in q], "g": g}).encode(),
-                       ("127.0.0.1", 47001))
+            send(q)  # through send(), so the keepalive repeats this pose and not an old one
             time.sleep(0.01)
         return q
 
     q = run((p0, q0), p0 + d, a.move_s)
     t_end = time.monotonic() + a.hold_s
     while time.monotonic() < t_end:
-        out.sendto(json.dumps({"t": "target", "arm": a.arm, "epoch": epoch, "q": [float(v) for v in q], "g": g}).encode(),
-                   ("127.0.0.1", 47001))
+        send(q)
         time.sleep(0.02)
     t = latest()
     pm, _ = kin.fk(a.arm, c, np.array(t["q"][:7]))

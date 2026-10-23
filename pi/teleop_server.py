@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Teleop brain: serves the Quest page + WebSocket over HTTPS (one port, one certificate), turns controller poses
-into joint targets, and sends them to motor_loop.py over localhost UDP.
+into joint targets, and sends them to motor_loop.py over localhost UDP. pi/start.sh starts it with the motor loop.
 
-  .venv/bin/python pi/teleop_server.py --scale 0.5 --vmax 0.1      # S5: half scale, low caps
-Open https://<pi-ip>:8443 on the Quest (Advanced -> Proceed once), press Enter AR.
+  .venv/bin/python pi/teleop_server.py --scale 0.5 --vmax 0.1      # e.g. half scale and a low speed cap
+Open https://<pi-ip>:8443 in the headset's browser (accept the self-signed certificate once) and tap START.
 
 Controls: squeeze = clutch (hold to drive that arm: the gripper follows the hand's position and angle, every joint
 over its full range), trigger = gripper (after a squeeze it moves only once the trigger reaches the gripper's
-current opening, so a held object isn't dropped), A/X = fine mode (moves and turns 0.3x),
+current opening, so a held object isn't dropped), A/X = fine mode (moves and turns 0.5x, slower),
+thumbstick while driving: tilt = slide along the gripper's pointing direction / sideways, hold down = insertion lock,
 B = align: stand beside the robot FACING THE SAME WAY IT FACES, point the right controller straight ahead, press B.
 Y = STOP (park + power off). Hold a thumbstick 1 s while the arms are off = power on; the arms then hold where they are.
 """
@@ -28,38 +29,43 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import kinematics as kin  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ALIGN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "align.json")
 # WebXR 'local' (x right, y up, z back) -> robot (x forward, y left, z up), operator facing robot-forward
 M0 = np.array([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
-SQ_ON, SQ_OFF = 0.7, 0.3
-# fine mode (2026-10-22, user: "so slow"; was 0.3x turning, 0.25x moving, lead x0.3, 3 cm/s, 0.3 m/s^2, slide 5 mm/s)
+SQ_ON, SQ_OFF = 0.7, 0.3  # squeeze engages above SQ_ON, releases below SQ_OFF
 FINE = 0.5  # fine mode: turning 0.5x
 FINE_POS = 0.5  # fine mode: moving 0.5x (2 cm of hand = 1 cm of gripper), for lining up a plug
-FINE_LEAD = 0.6  # fine mode / insertion lock: the loop's velocity lead x0.6 (less overshoot at a stop, less lag than x0.3)
+FINE_LEAD = 0.6  # fine mode / insertion lock: scale of the motor loop's velocity lead (less overshoot at a stop)
 # thumbstick tilt while driving: forward/back = slide straight in/out along the gripper's pointing direction (the plug's
 # axis); left/right = move to the operator's left/right, sideways to that axis (lining the plug up with a port)
 SLIDE_V, SLIDE_V_FINE = 0.015, 0.008  # m/s at full tilt (normal / fine mode); response is squared for fine control
 SLIDE_DZ = 0.15  # stick deadzone
-# sliding in (or sideways) stops, with a buzz, once the gripper presses with --push-n newtons (estimated from the joint
-# torques' change since the slide started), or as a backstop once the target is SLIDE_AHEAD past the measured grasp
-# point (kept under the loop's 'fell behind' limit). 2026-10-22: the old 5 mm stop pressed with only a few newtons,
-# too little to seat a plug; the real arm is stiff (16 Nm at 1.3 deg on J2), so 30 N comes within ~7 mm
+# sliding in (or sideways) stops, with a buzz, once the gripper presses with --push-n newtons (estimated from the change
+# in joint torques since the slide began), or as a backstop once the target is SLIDE_AHEAD past the measured grasp
+# point (kept under the motor loop's tracking-error limit). The arm is stiff (about 16 Nm at 1.3 deg on J2), so 30 N
+# builds up within about 7 mm of travel
 SLIDE_AHEAD = 0.025
 XR_TIMEOUT = 0.15  # s without controller data -> disengage
-# No "ready pose": the arms never move on their own, driving starts from wherever they are (2026-10-21: raising both
-# arms to point forward overloaded the left shoulder motors and the arm fell). From hanging straight down every
-# direction but further down works; the IK bends the elbow for "up".
-# joint speed the motor loop's follower allows (motor_loop VMAX); IK steps are kept under 90% of it, so the brain
-# never asks for a jump the loop would refuse (19:36: from the straight-down pose the IK asked J4 for 29 deg at once)
+# There is no ready pose: the arms never move on their own and driving starts from wherever they are (moving both arms
+# to a raised pose on start can overload the shoulder motors). From hanging straight down every direction except
+# further down is reachable; the IK bends the elbow to go up.
+# joint speed the motor loop's follower allows (motor_loop.VMAX, rad/s; keep the two in sync). Each IK step stays under
+# 90% of it, so the server never asks for a jump the loop would refuse (from the straight-down pose an unlimited IK
+# step can ask the elbow for ~30 deg at once)
 LOOP_VMAX = np.array([1.0, 1.0, 0.9, 0.9, 2.0, 2.0, 2.0])
-# gripper command speed, rad/s (--grip-rate): 2026-10-22 slowed from 3.0 (a full close took 0.35 s) to 1.2 (0.9 s), so
-# the squeeze on a held object can be set finely with the trigger
 GRIP_CATCH = 0.05  # rad: after a squeeze the gripper waits until the trigger comes this close to its current opening
+# an angle the wrist can't reach: the target stays at most this far past where the gripper got (see drive)
+ROT_SLIP = math.radians(5)
+# on release, a joint this far from its command is pressing on something (or still moving): it holds where it really
+# is, this much back from where it was pushing (see ArmBrain.settle)
+RELEASE_GAP, RELEASE_BACKOFF = math.radians(0.5), math.radians(0.5)
 JOINT_NAMES = ["shoulder (fwd/back)", "shoulder (out/in)", "upper-arm twist", "elbow", "forearm twist", "wrist bend",
                "wrist turn"]
 
 
 class OneEuro:
+    """One Euro filter (Casiez et al., 2012): a low-pass whose cutoff rises with speed, steady when still, quick when
+    moving."""
+
     def __init__(self, min_cutoff, beta, d_cutoff):
         self.mc, self.beta, self.dc = min_cutoff, beta, d_cutoff
         self.x = self.dx = None
@@ -104,11 +110,22 @@ def rotz(a):
 
 
 def cap_rotation(R_from, R_to, max_angle):
+    """R_to, or R_from turned toward it by at most max_angle (rad)."""
     w = kin.log_rot(R_to @ R_from.T)
     n = float(np.linalg.norm(w))
     if n <= max_angle:
-        return R_to, False
-    return kin.exp_rot(w * (max_angle / n)) @ R_from, True
+        return R_to
+    return kin.exp_rot(w * (max_angle / n)) @ R_from
+
+
+def pose_ok(p, q):
+    """A usable controller pose: 3 finite coordinates and a finite unit quaternion (x, y, z, w)."""
+    try:
+        p, q = np.asarray(p, float), np.asarray(q, float)
+    except (TypeError, ValueError):
+        return False
+    return p.shape == (3,) and q.shape == (4,) and bool(np.isfinite(p).all() and np.isfinite(q).all()) \
+        and abs(float(np.linalg.norm(q)) - 1.0) < 0.01
 
 
 class ArmBrain:
@@ -163,7 +180,7 @@ class ArmBrain:
     def on(self):
         return self.tel is not None and self.tel["mode"] == "on" and time.monotonic() - self.tel_t < 0.3
 
-    def engage(self, Cp, Cq, now):
+    def engage(self, Cp, Cq):
         x = np.array(self.tel["x"][:7])
         self.q_cmd = x
         self.home = kin.to_model(self.calib, x)  # the IK's posture pull keeps this pose: squeezing alone moves nothing
@@ -202,8 +219,7 @@ class ArmBrain:
         a = self.anchor
         a["C0p"], a["E0p"] = self.f_pos.x.copy(), self.ee_p.copy()
         a["C0R"], a["E0R"] = kin.quat_to_mat(self.q_smooth), self.ee_R.copy()
-        if "acc" in a:  # fine-mode turn accumulator restarts from the new anchor
-            a["prev"], a["acc"] = np.eye(3), np.eye(3)
+        a["prev"], a["acc"] = np.eye(3), np.eye(3)  # the scaled-turn accumulator restarts from the new anchor
 
     def drive(self, Cp, Cq, M, dt):
         """One pose sample while engaged -> new q_cmd. Cp/Cq in WebXR coordinates. Returns 'limit' on a cap hit."""
@@ -214,7 +230,7 @@ class ArmBrain:
         CR = kin.quat_to_mat(self.q_smooth)
         target_p = a["E0p"] + a["s"] * (M @ (Cp_f - a["C0p"]))
         # the hand's turn since the squeeze, about the same room axes, applied to the gripper around its grasp point
-        # (rot_scale 1 = as much as the hand, 0 = the gripper keeps its angle; fine mode 0.3x)
+        # (--rot-scale 1 = as much as the hand, 0 = the gripper keeps its angle; fine mode scales it by FINE)
         turn = M @ (CR @ a["C0R"].T) @ M.T
         if a["r"] != 1.0:  # scaled: add up each frame's turn x r (scaling the total jumps when the hand passes 180 deg)
             a["acc"] = kin.exp_rot(kin.log_rot(turn @ a["prev"].T) * a["r"]) @ a["acc"]
@@ -248,7 +264,7 @@ class ArmBrain:
             target_p = L["p0"] + L["axis"] * float(np.dot(target_p - L["p0"], L["axis"]))
             target_R = L["R"]
         # smooth follower: speed AND acceleration limited, braking early enough to stop on the target (no hard-clamp
-        # rubber band, no dead stop). A target moving at u trails by u^2 / (2 amax): 3 mm at 0.1 m/s.
+        # rubber band, no dead stop). A target moving at u trails by u^2 / (2 amax): about 1 mm at 0.1 m/s by default.
         vmax, amax = (self.args.fine_vmax, self.args.fine_amax) if self.fine else (self.args.vmax, self.args.amax)
         e = target_p - self.ee_p
         d = float(np.linalg.norm(e))
@@ -264,7 +280,7 @@ class ArmBrain:
             step = e
             self.ee_v = e / dt if dt > 0 else np.zeros(3)
         self.ee_p = self.ee_p + step
-        self.ee_R, rcap = cap_rotation(self.ee_R, target_R, self.args.wmax * dt)
+        self.ee_R = cap_rotation(self.ee_R, target_R, self.args.wmax * dt)
         self.trace = {"hand_cm": [round(float(v) * 100, 1) for v in M @ (np.asarray(Cp, float) - a["C0p"])],
                       "grip_cm": [round(float(v) * 100, 1) for v in self.ee_p - a["E0p"]]}
         t0 = time.perf_counter()
@@ -292,11 +308,29 @@ class ArmBrain:
             if res_p > 0.005 or res_r > math.radians(3) else []
         if res_p > 0.01:  # unreachable: stop the commanded pose running away from the arm
             self.ee_p, self.ee_R = kin.fk(self.name, self.calib, q)
+            a["E0R"] = turn.T @ self.ee_R  # and the angle too (see below)
             self.ee_v = np.zeros(3)
             return "limit"
-        # an angle the joints can't reach: buzz, and keep the target, so the gripper turns again as soon as the hand
-        # comes back to where the gripper stopped
+        # an angle the joints can't reach: buzz, and drop what is past the wrist's end (the target stays at most
+        # ROT_SLIP past where the gripper got), so the gripper stops there and turns back as soon as the hand does.
+        # A target kept in full keeps growing, and the IK chases it with detours (forearm twists, wrist swings) that
+        # can tip the gripper the opposite way to the hand
+        if res_r > ROT_SLIP and not self.lock:
+            R_now = kin.fk(self.name, self.calib, q)[1]
+            w = kin.log_rot(self.ee_R @ R_now.T)
+            self.ee_R = kin.exp_rot(w * (ROT_SLIP / float(np.linalg.norm(w)))) @ R_now
+            a["E0R"] = turn.T @ self.ee_R  # the hand's next turns start from here
         return "limit" if res_r > math.radians(3) or slide_hit else None
+
+    def settle(self):
+        """On release: hold where the arm really is, a little back from anything it presses on. Holding the last
+        command keeps a blocked joint pushing ever harder (the motor's speed loop winds up against the obstacle), up to
+        ~30 Nm on a shoulder within 1-2 s, enough to dip the motors' supply and reboot them."""
+        if self.tel is None or self.q_cmd is None:
+            return
+        q = np.array(self.tel["q"][:7])
+        d = self.q_cmd - q  # where each motor was pushing
+        self.q_cmd = np.where(np.abs(d) > RELEASE_GAP, q - np.sign(d) * RELEASE_BACKOFF, self.q_cmd)
 
     def grip(self, trigger, dt):
         g = self.calib.get("grip")
@@ -319,24 +353,21 @@ class Brain:
         self.unverified = [a for a, c in calib.items() if not c["verified"]]
         self.arms = {a: ArmBrain(a, args, calib[a]) for a in ("left", "right")}
         self.yaw = 0.0
-        if os.path.exists(ALIGN_PATH):
-            with open(ALIGN_PATH) as f:
-                self.yaw = json.load(f).get("yaw", 0.0)
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.ws = set()
         self.last_xr, self.last_send, self.last_ts = 0.0, 0.0, 0.0
-        self.xr_times, self.page_skips, self.page_fps = [], 0, 0.0
+        self.xr_times, self.page_fps = [], 0.0
         self.src_ts = []
         self.prev_buttons = {}
         # the page says when an AR session starts/ends: WebXR's 'local' space is re-centred each session, so the
-        # alignment (B) is asked for again. B is also needed once after every server start: a saved yaw belongs to an
-        # older AR session (2026-10-21: reusing one rotated every direction by ~90 deg).
+        # alignment (B) is asked for again. B is also needed once after every server start: a yaw from an older AR
+        # session no longer matches the room.
         self.xr_active, self.aligned, self.xr_ws = False, False, None
         self.seen = {h: {"frames": 0, "ok": 0, "sq_max": 0.0, "tr_max": 0.0, "presses": [0, 0, 0]} for h in ("left", "right")}
         self.msg = ""
         os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
         self.log = open(os.path.join(ROOT, "logs", time.strftime("brain-%Y%m%d-%H%M%S.jsonl")), "a", buffering=1 << 16)
-        self.event("start", args=vars(args), yaw=self.yaw, unverified=self.unverified)
+        self.event("start", args=vars(args), unverified=self.unverified)
 
     @property
     def M(self):
@@ -357,7 +388,6 @@ class Brain:
             pass
 
     def send_targets(self):
-        now = time.monotonic()
         for a in self.arms.values():
             if a.on and a.q_cmd is not None and a.epoch is not None:
                 self.to_loop({"t": "target", "arm": a.name, "epoch": a.epoch,
@@ -366,6 +396,7 @@ class Brain:
                               "lead": FINE_LEAD if (a.fine or a.lock) else 1.0})
         self.last_send = time.monotonic()
 
+    # haptic patterns: [intensity 0-1, pulse ms, pause ms] per pulse
     PATTERNS = {"fine": [[0.5, 40, 90], [0.5, 40, 0]], "align": [[0.8, 350, 0]],
                 "stop": [[1.0, 150, 100], [1.0, 150, 100], [1.0, 150, 0]], "fault": [[1.0, 400, 0]],
                 "resync": [[0.8, 120, 80], [0.8, 120, 0]], "lost": [[1.0, 80, 60], [1.0, 80, 0]], "limit": [[0.3, 25, 0]]}
@@ -414,18 +445,17 @@ class Brain:
                     sn["presses"][i] += 1
                     self.event("button", hand=hand, button=["A/X", "B/Y", "stick"][i])
                     print(time.strftime("%H:%M:%S"), f"button {hand} {['A/X', 'B/Y', 'stick'][i]}", flush=True)
+            ok = bool(H.get("ok")) and pose_ok(H.get("p"), H.get("q"))  # tracked, and a pose that can be used
             if edge[0]:  # A / X: fine mode (re-anchor so the scale change can't jump)
                 a.fine = not a.fine
                 self.say(f"{hand}: fine mode {'on' if a.fine else 'off'}")
-                if a.engaged and H.get("ok"):
-                    a.engage(H["p"], H["q"], now)
+                if a.engaged and ok:
+                    a.engage(H["p"], H["q"])
                 await self.haptic(hand, "fine")
             if edge[1] and hand == "right" and H.get("aim"):  # B: align
                 ax, _, az = H["aim"]
                 if math.hypot(ax, az) > 0.3:
                     self.yaw = -math.atan2(-ax, -az)
-                    with open(ALIGN_PATH, "w") as f:
-                        json.dump({"yaw": self.yaw}, f)
                     for o in self.arms.values():
                         o.engaged = False
                     self.aligned = True
@@ -448,10 +478,10 @@ class Brain:
             sq = H.get("sq", 0.0)
             was = a.clutch
             a.clutch = sq > SQ_OFF if was else sq > SQ_ON
-            ok = bool(H.get("ok"))
             if not a.clutch or not ok:
                 if a.engaged:
                     a.engaged = False
+                    a.settle()
                     self.event("release", arm=hand, why="tracking lost" if not ok else "squeeze released")
                     if not ok:
                         self.say(f"{hand}: tracking lost, holding")
@@ -478,9 +508,9 @@ class Brain:
                 elif a.on and not was or (a.on and a.want_resume):
                     if self.unverified and hand in self.unverified and not self.args.allow_unverified:
                         if not was:
-                            self.say(f"{hand}: calibration not verified (S1) - refusing to drive")
+                            self.say(f"{hand}: calibration not verified - refusing to drive")
                     else:
-                        a.engage(H["p"], H["q"], now)
+                        a.engage(H["p"], H["q"])
                         a.want_resume = False
                         self.event("engage", arm=hand, E0=[round(v, 4) for v in a.anchor["E0p"]])
             if a.engaged:
@@ -538,19 +568,19 @@ class Brain:
             for a in self.arms.values():
                 a.engaged = False
             self.say("AR ended: arms hold")
-        elif cmd == "ready":
-            self.say("there is no ready pose any more: the arms hold where they are")
 
     def status(self):
         now = time.monotonic()
+        # pose rate over the samples of the last second (stats() trims xr_times to its last sample once a second)
         recent = [t for t in self.xr_times if now - t < 1.0]
+        pose_hz = round((len(recent) - 1) / max(now - recent[0], 1e-3), 1) if len(recent) > 1 else 0.0
         arms = {}
         for n, a in self.arms.items():
             t = a.tel
             mode = "no motor loop" if t is None or now - a.tel_t > 0.5 else t["mode"]
             mode = {"starting_read": "starting", "preload": "starting", "enabling": "starting", "starting_hold": "starting"}.get(mode, mode)
             arms[n] = {"mode": mode, "clutch": a.engaged, "fine": a.fine, "msg": (t or {}).get("reason", "")}
-        return {"t": "status", "arms": arms, "pose_hz": len(recent), "msg": self.msg, "hud": self.hud(arms)}
+        return {"t": "status", "arms": arms, "pose_hz": pose_hz, "msg": self.msg, "hud": self.hud(arms)}
 
     @staticmethod
     def plain(reason):
@@ -590,7 +620,7 @@ class Brain:
         def out(headline, detail, level):
             return {"headline": headline, "detail": detail, "level": level, "left": label["left"], "right": label["right"]}
         if not used:
-            return out("Robot program not running", ["On the laptop, run: pi/start.sh"], "error")
+            return out("Robot program not running", ["On the Pi, run: pi/start.sh"], "error")
         if faults := [n for n in used if arms[n]["mode"] == "fault"]:
             return out(f"{name(faults)} arm fault", [self.plain(arms[faults[0]]["msg"]), "Press Y to stop both arms."], "error")
         if [n for n in used if arms[n]["mode"] == "parking"]:
@@ -686,6 +716,11 @@ class Brain:
             a.ik_ms, a.ik_res = [], []
 
 
+def reject_nan(word):
+    """json.loads hook for NaN / Infinity: not valid JSON (browsers never send them), so the message is dropped."""
+    raise ValueError(word)
+
+
 async def ws_handler(request):
     brain = request.app["brain"]
     ws = web.WebSocketResponse(heartbeat=5.0, max_msg_size=1 << 16)
@@ -697,7 +732,7 @@ async def ws_handler(request):
             if msg.type != WSMsgType.TEXT:
                 continue
             try:
-                m = json.loads(msg.data)
+                m = json.loads(msg.data, parse_constant=reject_nan)
             except ValueError:
                 continue
             if m.get("t") == "xr":
@@ -726,7 +761,7 @@ async def status_json(request):
 
 
 async def cmd_http(request):
-    """POST /cmd {"cmd": "stop"|"power_on", "arm": ...}: the same commands as the page, from a laptop."""
+    """POST /cmd {"cmd": "stop"|"power_on"}: the same commands as the page (always both arms), e.g. from a laptop."""
     m = await request.json()
     await request.app["brain"].on_cmd(m)
     return web.json_response(request.app["brain"].status())
@@ -735,31 +770,33 @@ async def cmd_http(request):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8443)
-    ap.add_argument("--http-port", type=int, default=0, help="also serve plain http on localhost (adb reverse)")
+    ap.add_argument("--http-port", type=int, default=0,
+                    help="also serve plain http on localhost (for a headset on USB via adb reverse)")
     ap.add_argument("--cert", default=os.path.join(ROOT, "certs", "cert.pem"))
     ap.add_argument("--key", default=os.path.join(ROOT, "certs", "key.pem"))
     ap.add_argument("--loop-port", type=int, default=47001)
     ap.add_argument("--tel-port", type=int, default=47002)
-    ap.add_argument("--scale", type=float, default=1.0)
-    # 2026-10-22 (user: "still moving quite slowly", trailing ~100 ms): 0.15 -> 0.35 m/s, 1.5 -> 4 m/s^2, rotation 4 -> 6 Hz
-    ap.add_argument("--vmax", type=float, default=0.35, help="end-effector speed cap m/s")
+    ap.add_argument("--scale", type=float, default=1.0, help="hand-to-gripper motion scale (0.5 = half)")
+    ap.add_argument("--vmax", type=float, default=0.35, help="grasp-point speed cap m/s")
     ap.add_argument("--fine-vmax", type=float, default=0.06, help="fine mode grasp-point speed cap m/s")
     ap.add_argument("--amax", type=float, default=4.0, help="grasp-point acceleration limit m/s^2 (smooth follower)")
     ap.add_argument("--fine-amax", type=float, default=0.8, help="same, fine mode")
     ap.add_argument("--wmax", type=float, default=2.0, help="end-effector rotation cap rad/s (the wrist joints' own top speed)")
     ap.add_argument("--jump", type=float, default=0.05, help="max target step per sample, m")
-    ap.add_argument("--grip-rate", type=float, default=1.2, help="rad/s the gripper opens/closes at (full travel ~1.1 rad)")
+    ap.add_argument("--grip-rate", type=float, default=1.2,
+                    help="rad/s the gripper opens/closes at (full travel ~1.1 rad: slow enough to set a grip finely)")
     ap.add_argument("--push-n", type=float, default=30.0, help="N: the thumbstick push in stops at this force")
     ap.add_argument("--min-cutoff", type=float, default=2.0)
-    # beta multiplies the hand speed in m/s: 0.04 (Enactic's value) made the filter a fixed ~2 Hz low-pass with
-    # ~80 ms delay at every speed; 20 keeps the same still-hand steadiness with 11-22 ms delay (measured on the Pi)
+    # beta multiplies the hand speed in m/s: a small beta (e.g. 0.04) leaves the filter a fixed ~2 Hz low-pass with
+    # ~80 ms delay at every speed; 20 keeps a still hand as steady with 11-22 ms delay when moving (measured on a Pi 5)
     ap.add_argument("--beta", type=float, default=20.0)
     ap.add_argument("--d-cutoff", type=float, default=1.5)
     ap.add_argument("--rot-cutoff", type=float, default=6.0, help="Hz, orientation SLERP smoothing")
     ap.add_argument("--ik", choices=["position", "pose"], default="pose",
                     help="pose: the gripper follows the hand's position and angle (default); position: position only")
     ap.add_argument("--rot-scale", type=float, default=1.0, help="1 = the gripper turns as much as the hand (default)")
-    ap.add_argument("--allow-unverified", action="store_true")
+    ap.add_argument("--allow-unverified", action="store_true",
+                    help="drive arms whose calibration is not marked verified in calib.json")
     args = ap.parse_args()
 
     brain = Brain(args)

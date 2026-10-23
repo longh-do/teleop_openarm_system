@@ -2,8 +2,8 @@
 """Simulated DAMIAO arm on a vcan bus, for testing motor_loop.py without hardware.
 
   sudo ip link add dev vcan0 type vcan && sudo ip link set vcan0 up
-  python3 tools/fake_motors.py vcan0 --drop-j1 3.0     # J1 goes silent ~35 ms every 3 s, like the real right arm
-Answers enable/disable/clear, position-velocity (0x100+j), MIT (j) and register reads (0x7FF .. 33 RID).
+  python3 tools/fake_motors.py vcan0 --drop-j1 3.0     # J1 also drops its replies for ~35 ms every 3 s
+Answers enable/disable/clear, position-velocity (0x100+j), MIT (j), and register reads and writes (0x7FF, 0x33/0x55).
 """
 import argparse
 import math
@@ -24,10 +24,10 @@ def encode_reply(j, state, p, v, t, vmax, tmax):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("bus")
     ap.add_argument("--drop-j1", type=float, default=0, help="J1 silent ~35 ms every N s (0 = never)")
-    ap.add_argument("--start", default="0,-0.5,0,0.8,0,0,0,0.3")
+    ap.add_argument("--start", default="0,-0.5,0,0.8,0,0,0,0.3", help="J1..J8 start angles, motor rad")
     ap.add_argument("--dead", type=int, default=0, help="this joint never answers")
     ap.add_argument("--lag-ms", type=float, default=25.0, help="joint response time (the real J5-J7 lag ~180 ms)")
     ap.add_argument("--stop-k", type=float, default=30.0, help="Nm/rad an end stop pushes back (the real arm: ~700)")
@@ -39,6 +39,7 @@ def main():
     pos = [0.0] + [float(x) for x in args.start.split(",")]
     vel, on, tgt, spd = [0.0] * 9, [False] * 9, list(pos), [0.0] * 9
     mit_kp, last = [0.0] * 9, time.monotonic()
+    regs = {}  # (joint, register) -> value written (0x55); reads return it, as from a motor's RAM
     next_drop, drop_until = time.monotonic() + (args.drop_j1 or 1e9), 0.0
     while True:
         can_id, _, d = struct.unpack(dm.FRAME, s.recv(16))
@@ -60,8 +61,11 @@ def main():
             drop_until, next_drop = now + random.uniform(0.03, 0.04), now + args.drop_j1
         if can_id == 0x7FF:
             j, rid = d[0], d[3]
-            if d[2] == 0x33 and 1 <= j <= 8:
+            if d[2] == 0x55 and 1 <= j <= 8:
+                regs[j, rid] = struct.unpack("<f", d[4:8])[0]
+            elif d[2] == 0x33 and 1 <= j <= 8:
                 val = {dm.RID_VMAX: dm.VMAX[j], dm.RID_TMAX: dm.TMAX[j], dm.RID_PMAX: dm.PMAX}.get(rid, 0.0)
+                val = regs.get((j, rid), val)
                 s.send(struct.pack(dm.FRAME, 0x10 + j, 8, bytes([j, 0, 0x33, rid]) + struct.pack("<f", val)))
             continue
         if 0x101 <= can_id <= 0x108:

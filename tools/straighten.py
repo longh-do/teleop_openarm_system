@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Turn an arm's twist joints back to the normal hanging pose with its own motors, slowly, one joint at a time.
-  (motor_loop.py running with the arm ON and hanging, teleop_server.py NOT running: one brain at a time)
+  (motor_loop.py running with the arm on and hanging; teleop_server.py stopped: one program sends targets)
   .venv/bin/python tools/straighten.py right,left --then-off
 Only the twist and wrist joints move (J7 wrist turn, J6 wrist bend, J5 forearm twist, J3 upper-arm twist), at 14 deg/s.
 The shoulders and elbow stay where they are: hanging, these joints carry almost no weight. A joint that pushes 1.5 Nm
 harder than at its start (touching something), or J6 going silent while J5 turns (its cable runs through the forearm
 twist), stops that joint where it is. --then-off switches the arms off afterwards (limp, still hanging), so the next
-start.sh starts from the straightened pose: a normal STOP would park back to the twisted pose the arm was switched on in.
+pi/start.sh starts from the straightened pose: a normal STOP would park back to the twisted pose the arm was switched
+on in.
 """
 import argparse
 import json
@@ -29,7 +30,7 @@ PUSH = 1.5  # Nm more than at the start of the move = touching something
 FRAMES = 3
 
 
-def turn(link, c, j, want_motor):
+def turn(link, j, want_motor):
     i = j - 1
     t = link.tick()
     tau0, miss6 = t["tau"][i], t["misses"][5]
@@ -49,13 +50,15 @@ def turn(link, c, j, want_motor):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("arms", nargs="?", default="right,left")
+    ap.add_argument("arms", nargs="?", default="right,left", help="right, left or right,left")
     ap.add_argument("--loop-port", type=int, default=47001)
     ap.add_argument("--tel-port", type=int, default=47002)
     ap.add_argument("--then-off", action="store_true", help="switch the arms off afterwards (they stay hanging)")
     a = ap.parse_args()
     calib = kin.load_calib()
     arms = [n for n in a.arms.split(",") if n]
+    if not set(arms) <= {"left", "right"}:  # checked before anything moves
+        ap.error("arms: right, left or right,left")
     for arm in arms:
         c = calib[arm]
         link = Link(arm, a.loop_port, a.tel_port)
@@ -69,7 +72,7 @@ def main():
                 if abs(goal - link.q[j - 1]) < math.radians(1):
                     continue
                 print(f"[{arm}] {NAMES[j]}: {math.degrees(goal - link.q[j - 1]):+.0f} deg ... ", end="", flush=True)
-                print(turn(link, c, j, goal), flush=True)
+                print(turn(link, j, goal), flush=True)
         except Abort as e:
             print(f"\n[{arm}] stopped: {e}", flush=True)
         after = np.degrees(kin.to_model(c, link.newest()["q"][:7])) - NORMAL_MODEL_DEG[arm]

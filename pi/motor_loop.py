@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Real-time motor loop for the OpenArm arms (both buses in ONE process; see TRACKER D1).
+"""Real-time motor loop for the OpenArm arms (both CAN buses in one process).
 
 Each cycle, per arm in turn: send 8 frames (J1-J7 position-velocity, J8 MIT), wait for that arm's 8 replies
 (the two buses share one USB adapter, which drops replies when the bursts overlap), then the next arm.
 Every joint follows its goal through a velocity/acceleration-limited smoother.
 
-Targets come from the brain over localhost UDP (newest wins):
-  {"t":"target","arm":"left","epoch":3,"q":[7 motor rad],"g":gripper motor rad or null}
+Targets come from the brain (pi/teleop_server.py) over localhost UDP (newest wins):
+  {"t":"target","arm":"left","epoch":3,"q":[7 motor rad],"g":gripper motor rad or null,"lead":0..1 (optional)}
   {"t":"cmd","cmd":"stop"|"power_on"|"resume"|"estop","arm":"left"|"right"|"all"}
+"lead" scales the velocity lead (default 1).
 Telemetry goes back at 50 Hz to --tel-port. The epoch is bumped whenever the follower is reset, and targets
 stamped with an older epoch are ignored, so a stale target can never make the arm jump.
 
@@ -26,7 +27,6 @@ import math
 import os
 import signal
 import socket
-import struct
 import sys
 import time
 
@@ -37,27 +37,25 @@ import numpy as np  # noqa: E402
 
 ARM_BUS = {"right": "can0", "left": "can1"}
 JOINTS = range(1, 9)
-# follower speed / acceleration limits. The DM4340 joints (J3, J4) follow their own position loop sluggishly
-# (S1: J4 fell 8.6 deg behind at 0.6 rad/s with only 2.8 Nm load), so they get lower limits
-# 2026-10-22: J3/J4 0.6 -> 0.9 rad/s, 3 -> 4 rad/s^2 (the user felt the arm trailing; the lead now covers their lag)
+# follower speed / acceleration limits. The DM4340 joints (J3, J4) have the slowest position loop of the arm (at the
+# factory KP_APR), so they get a lower speed limit
 VMAX = {1: 1.0, 2: 1.0, 3: 0.9, 4: 0.9, 5: 2.0, 6: 2.0, 7: 2.0, 8: 3.0}  # rad/s
-# wrist J5-J7 4 -> 20 rad/s^2 (2026-10-22): quick hand twists reverse the wrist faster than 4 allowed, the follower ran
-# 29 deg behind the target and the jump guard refused it ("too sudden"); the wrist motors carry only the gripper
+# the wrist motors (J5-J7) carry only the gripper: a high acceleration lets a quick hand twist reverse them without the
+# follower falling so far behind the target that the jump guard refuses it
 AMAX = {1: 4.0, 2: 4.0, 3: 4.0, 4: 4.0, 5: 20.0, 6: 20.0, 7: 20.0, 8: 12.0}  # rad/s^2
 PARK_V, PARK_A = 0.3, 1.0
-# Nm, sustained -> hold. Raised 2026-10-22 (was 15/15/10/10/4/4/4): pushing a plug into the adapter needs a firm push,
-# and the lower values paused the arm halfway (the user accepts the stronger pushes)
+# Nm, sustained -> hold (blocked). High enough that a firm push, e.g. pushing a connector in, does not trip it
 BLOCK_TORQUE = {1: 30.0, 2: 30.0, 3: 20.0, 4: 20.0, 5: 6.0, 6: 6.0, 7: 6.0}
 TORQUE_CYCLES = 10  # consecutive cycles over BLOCK_TORQUE before tripping
 # MIT gains; the command is clamped to +-grip torque/KP around the position, so the squeeze tops out at the grip torque
-# (--grip-torque; 1.0 Nm let a cable slip in the fingers while pushing it into the adapter, 2026-10-21)
+# (--grip-torque; at 1 Nm a held cable slips in the fingers while it is pushed into a connector)
 GRIP_KP, GRIP_KD, GRIP_TORQUE = 8.0, 0.5, 3.0
 JUMP_GUARD = 0.5  # rad: a target this far from the follower is refused
 BACKOFF = math.radians(3)  # rad a strained joint is backed off its obstacle on a torque trip
 TEMP_HOLD, TEMP_PARK = 70, 80  # degC (max of MOSFET / rotor): hold, then park
 GOAL_V_DECAY_S = 0.04  # forget the target's velocity estimate when targets stop for this long
-LEAD_V_HZ = 4.0  # the velocity lead uses the follower's speed low-passed at this cutoff: small target dither
-# x a 180-350 ms lead was a +-1 deg J4 command wobble with a still hand
+LEAD_V_HZ = 4.0  # the velocity lead uses the follower's speed low-passed at this cutoff: unfiltered, small target
+# dither x a 180-350 ms lead makes a +-1 deg J4 command wobble while the hand is still
 ENABLE_HOLD_S, GRACE_CYCLES = 0.5, 10
 
 
@@ -79,7 +77,7 @@ class Arm:
         self.sock = dm.open_bus(self.bus)
         self.vmax_reg, self.tmax_reg = dict(dm.VMAX), dict(dm.TMAX)
         n = 9
-        self.pos, self.vel, self.tau = [0.0] * n, [0.0] * n, [0.0] * n
+        self.pos, self.tau = [0.0] * n, [0.0] * n
         self.state, self.temp = [-1] * n, [0] * n
         self.seen = [False] * n  # ever replied
         self.x, self.v, self.goal, self.goal_v = [0.0] * n, [0.0] * n, [0.0] * n, [0.0] * n
@@ -94,12 +92,8 @@ class Arm:
         self.err_max = [0.0] * n  # per joint, reset each stats second
         self.err_dir = [0.0] * n  # that error, signed: - = behind the follower's motion (lag), + = ahead (overshoot)
         self.v_lp, self.lead_scale, self.lead_want = [0.0] * n, 1.0, 1.0
-        self.tau_prev, self.ripple_sum, self.ripple_n = [None] * n, [0.0] * n, 0  # buzz detector
+        self.tau_prev, self.ripple_sum, self.ripple_n = [None] * n, [0.0] * n, 0  # torque ripple: shows a buzzing motor
         self.late = [0] * n  # replies that arrived after the reply timeout, per joint
-        # gear play (--watch-output): the reported position comes from the rotor sensor (before the gearbox); register
-        # 0x51 is the output-shaft sensor. Their difference, minus its value at start, is how far the link sits off
-        # the rotor's idea of it: play/backlash and flex in the gearbox
-        self.xout_off, self.play, self.play_max, self.watch_i = [None] * n, [0.0] * n, [0.0] * n, 0
         self.tx_full = 0  # sends refused because the bus is not acknowledging
         self.limits = None  # motor-space (lo, hi) per joint 1-7 when calibration is verified
 
@@ -128,9 +122,9 @@ class Arm:
 
     # ---- bus ----------------------------------------------------------------------------------------------
     def apply_gains(self, log):
-        """Motor-side tuning in RAM (S8): the factory position gain KP_APR=54 and ACC/DEC=2 make the joints trail a
-        streamed target by ~150 ms; others run KP_APR 200-400, ACC 10-50. Written with the motors off, at start and
-        at every power-on (an arm power cycle resets RAM). Never saved to flash."""
+        """Motor-side position-loop tuning (KP_APR, ACC/DEC) in RAM: at the factory KP_APR=54 and ACC/DEC=2 the joints
+        trail a streamed target by ~0.15-0.2 s, the DM4340 joints (J3/J4) by ~0.45 s. Written with the motors off, at
+        start and at every power-on (an arm power cycle resets RAM). Never saved to flash."""
         g = self.args.gains.get(self.name)
         if not g:
             return
@@ -152,7 +146,7 @@ class Arm:
 
     def read_registers(self, log):
         for j in JOINTS:
-            if j in getattr(self, "skip", ()):
+            if j in self.skip:
                 continue
             for rid, table in ((dm.RID_VMAX, self.vmax_reg), (dm.RID_TMAX, self.tmax_reg)):
                 v = dm.read_register(self.sock, j, rid)
@@ -162,7 +156,7 @@ class Arm:
                     log.event("register_unread", arm=self.name, joint=j, rid=rid)
         tune = {}  # the posvel loop's own settings, as they are in the motors' RAM right now (logged, never written here)
         for j in range(1, 8):
-            if j not in getattr(self, "skip", ()):
+            if j not in self.skip:
                 tune[j] = [None if v is None else round(v, 2) for v in
                            (dm.read_register(self.sock, j, rid) for rid in (dm.RID_KP_APR, dm.RID_ACC, dm.RID_DEC))]
         log.event("registers", arm=self.name, vmax=self.vmax_reg, tmax=self.tmax_reg, kp_apr_acc_dec=tune)
@@ -178,12 +172,12 @@ class Arm:
             return 8, dm.mit(p, 0.0, GRIP_KP, GRIP_KD, 0.0, self.vmax_reg[8], self.tmax_reg[8])
         speed = PARK_V if self.mode == "parking" else \
             VMAX[j] * self.args.motor_speed_scale * (self.args.motor_speed_scale_34 if j in (3, 4) else 1.0)
-        # the motors' own position loop trails its target like a ~0.14 s first-order lag (measured S2):
-        # command ahead by speed x lag so the joint itself lands on the follower
+        # the motor's own position loop trails its target like a first-order lag: command ahead by speed x lag
+        # (lead_ms) so the joint itself lands on the follower
         ll = self.args.lead_list.get(self.name)
         lead_ms = ll[j - 1] if ll else (self.args.lead_ms_34 if j in (3, 4) else self.args.lead_ms)
-        # lead on the smaller of the follower's speed and its 4 Hz low-pass (same sign only): dither averages out,
-        # and braking cuts the lead at once (a low-pass alone kept leading while stopping: 5 mm overshoot in the sim)
+        # lead on the smaller of the follower's speed and its LEAD_V_HZ low-pass (same sign only): dither averages out,
+        # and braking cuts the lead at once (a low-pass alone keeps leading while braking: 5 mm overshoot in simulation)
         v, vl = self.v[j], self.v_lp[j]
         v_lead = (min(v, vl) if v > 0 else max(v, vl)) if v * vl > 0 else 0.0
         lead = v_lead * self.lead_scale * lead_ms / 1000 if self.mode in ("on", "parking", "hold", "fault") else 0.0
@@ -198,7 +192,7 @@ class Arm:
                 j = self._take(*dm.recv(s))
                 if j:
                     self.late[j] += 1
-        except BlockingIOError:
+        except OSError:  # queue empty, or a bus error (interface down): missing replies are handled as silence
             pass
         t0 = time.monotonic()
         for j in JOINTS:
@@ -208,14 +202,6 @@ class Arm:
                 except OSError:  # TX queue full: nobody acknowledges (arm power off / cable out). Don't crash.
                     self.tx_full += 1
                     break
-        watch = self.args.watch_list
-        if watch and self.mode not in ("off",) and not self.tx_full:  # one output-sensor read per cycle, in turn
-            jw = watch[self.watch_i % len(watch)]
-            self.watch_i += 1
-            try:
-                dm.send(s, 0x7FF, bytes([jw, 0, 0x33, 0x51, 0, 0, 0, 0]))
-            except OSError:
-                pass
         deadline = t0 + timeout
         while got & self.want != self.want:
             left = deadline - time.monotonic()
@@ -224,7 +210,7 @@ class Arm:
             s.settimeout(left)
             try:
                 j = self._take(*dm.recv(s))
-            except (TimeoutError, BlockingIOError):
+            except OSError:  # timeout or bus error
                 break
             if j:
                 got |= 1 << j
@@ -240,16 +226,9 @@ class Arm:
         if d[1] == 0 and d[2] in (0x33, 0x55):
             # a register reply ([id, 0, 0x33/0x55, rid, value]) left in the queue, not feedback: reading it as a
             # position would say "-12.49 rad" and preload a garbage target. Real joints never sit near -PMAX.
-            if d[2] == 0x33 and d[3] == 0x51 and self.seen[j]:  # output-shaft angle: gear play vs the rotor's angle
-                xo = struct.unpack("<f", d[4:8])[0]
-                diff = math.remainder(xo - self.pos[j], 2 * math.pi)
-                if self.xout_off[j] is None:
-                    self.xout_off[j] = diff
-                self.play[j] = math.remainder(diff - self.xout_off[j], 2 * math.pi)
-                self.play_max[j] = max(self.play_max[j], abs(self.play[j]))
             return 0
-        st, p, v, t, tm, tr = dm.decode(d, self.vmax_reg[j], self.tmax_reg[j])
-        self.state[j], self.pos[j], self.vel[j], self.tau[j], self.temp[j] = st, p, v, t, max(tm, tr)
+        st, p, _, t, tm, tr = dm.decode(d, self.vmax_reg[j], self.tmax_reg[j])
+        self.state[j], self.pos[j], self.tau[j], self.temp[j] = st, p, t, max(tm, tr)
         self.seen[j] = True
         return j
 
@@ -260,7 +239,7 @@ class Arm:
             self.tx_full = 0
             self.reset_follower(False)
             self.buzz += 1
-            self.set_mode("fault", "bus not acknowledging: is the arm power off? (power on again, then Power on)", log)
+            self.set_mode("fault", "bus not acknowledging: is the arm power off? (restore it, then Power on)", log)
         elif self.tx_full and self.mode == "off":
             self.tx_full = 0
         for j in JOINTS:
@@ -374,8 +353,8 @@ class Arm:
                     self.torque_count[j] = 0
                     tau = self.tau[j]
                     self.hold(f"J{j} torque {tau:+.1f} Nm (blocked?)", log, True)
-                    # back the strained joint off its obstacle so it stops pressing while it holds (S5: J7 pressed
-                    # its end stop at 5 Nm in hold and reached 91 degC)
+                    # back the strained joint off its obstacle so it stops pressing while it holds (a wrist motor held
+                    # against its end stop at 5 Nm heats past 90 degC)
                     self.x[j] = self.goal[j] = self.pos[j] - math.copysign(BACKOFF, tau)
                     return
             else:
@@ -389,8 +368,9 @@ class Arm:
     def accept_target(self, msg, now, log):
         if self.mode != "on" or msg.get("epoch") != self.epoch:
             return
-        q = msg["q"]
-        if len(q) != 7 or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in q):
+        q = msg.get("q")
+        if not isinstance(q, list) or len(q) != 7 or \
+                not all(isinstance(v, (int, float)) and math.isfinite(v) for v in q):
             return
         worst = max(range(7), key=lambda i: abs(q[i] - self.x[i + 1]))
         if abs(q[worst] - self.x[worst + 1]) > JUMP_GUARD:
@@ -470,7 +450,7 @@ class Arm:
         return False
 
     def command(self, cmd, now, log):
-        if cmd == "power_on" and self.mode == "off":
+        if cmd == "power_on" and self.mode == "off" and not self.args.read_only:
             self.apply_gains(log)  # motors are off here; an arm power cycle may have reset them
             self.phase_t = now
             self.set_mode("starting_read", "reading joints (motors off)", log)
@@ -497,8 +477,7 @@ class Arm:
         return {"mode": self.mode, "reason": self.reason, "epoch": self.epoch, "buzz": self.buzz, "skip": sorted(self.skip),
                 "x": r(self.x), "q": r(self.pos), "tau": [round(self.tau[j], 2) for j in JOINTS],
                 "st": self.state[1:], "temp": self.temp[1:], "stale": [self.gap_start[j] is not None for j in JOINTS],
-                "misses": self.misses[1:], "can_errors": self.can_errors,
-                "play": [round(self.play[j], 5) for j in JOINTS]}
+                "misses": self.misses[1:], "can_errors": self.can_errors}
 
     def disable_now(self):
         for _ in range(3):
@@ -592,14 +571,12 @@ def main():
     ap.add_argument("--lead", default="", help="override velocity lead ms: one value or 7 comma-separated (tests)")
     ap.add_argument("--lead-ms", type=float, default=180, help="velocity lead to cancel the motors' position-loop lag")
     ap.add_argument("--lead-ms-34", type=float, default=350, help="same, for the DM4340 joints J3/J4")
-    # 2.0 (was 1.0): the posvel speed limit capped a joint that fell behind at exactly the follower's speed, so it could
-    # never catch up while moving (J3/J4 trailed 2-4 deg, 2026-10-22); a per-frame field, not a motor register
+    # the posvel speed limit is a per-frame field, not a motor register. Capped at the follower's own speed, a joint
+    # that has fallen behind could never catch up while moving, hence the headroom
     ap.add_argument("--motor-speed-scale", type=float, default=2.0, help="x the follower vmax, sent as the posvel speed limit")
     ap.add_argument("--motor-speed-scale-34", type=float, default=1.0,
-                    help="extra x for J3/J4 only: posvel speed headroom so the sluggish DM4340s can catch up (test 1.5)")
+                    help="extra x for J3/J4 only: more posvel speed headroom for the slower DM4340 joints to catch up")
     ap.add_argument("--grip-torque", type=float, default=GRIP_TORQUE, help="Nm: the grippers' strongest squeeze")
-    ap.add_argument("--watch-output", default="", help="joints whose output-shaft sensor is read in turn, e.g. 1,2,3,4 "
-                    "(gear play shows as play_deg in the stats and 'play' in telemetry)")
     ap.add_argument("--park-timeout", type=float, default=30)
     ap.add_argument("--read-only", action="store_true", help="never enable; print angles once a second")
     ap.add_argument("--test", choices=["none", "hold", "sine", "probe"], default="none")
@@ -642,7 +619,6 @@ def main():
                                     "acc": [args.acc] * 7 if args.acc is not None else base["acc"]}
     if args.lead:
         args.lead_list = {arm_name: seven(args.lead) for arm_name in ("right", "left")}
-    args.watch_list = [int(v) for v in args.watch_output.split(",") if v]
     names = [a.strip() for a in args.arms.split(",") if a.strip()]
     assert all(n in ARM_BUS for n in names), f"--arms must be from {list(ARM_BUS)}"
     other = None if all(ARM_BUS[n].startswith("vcan") for n in names) else find_other_writer()
@@ -676,7 +652,7 @@ def main():
     log.event("start", args=vars(args), realtime=rt, calib_verified={a.name: a.limits is not None for a in arms})
     print(f"motor loop: arms {names}, {args.hz:.0f} Hz, {rt}, log {log.path}", flush=True)
     if not any(a.limits is not None for a in arms):
-        print("note: calibration not verified -> joint-limit check at start is skipped", flush=True)
+        print("note: calibration not verified -> the motor loop does not enforce joint limits", flush=True)
 
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.bind(("127.0.0.1", args.port))
@@ -738,6 +714,8 @@ def main():
                 try:
                     msg = json.loads(data)
                 except ValueError:
+                    continue
+                if not isinstance(msg, dict):
                     continue
                 if msg.get("t") == "target" and msg.get("arm") in names:
                     newest[msg["arm"]] = msg
@@ -881,14 +859,12 @@ def stats(args, arms, periods, works, late, overruns, log, span, t_start):
                              "err_deg": [round(math.degrees(e), 2) for e in a.err_max[1:8]],
                              "err_dir_deg": [round(math.degrees(e), 2) for e in a.err_dir[1:8]],
                              "ripple": [round(math.sqrt(a.ripple_sum[j] / a.ripple_n), 3) if a.ripple_n else 0.0 for j in range(1, 8)],
-                             "play_deg": [round(math.degrees(a.play_max[j]), 3) for j in range(1, 8)],
                              "max_tau": [round(a.tau[j], 1) for j in JOINTS],
                              "temp": a.temp[1:]} for a in arms}}
     log.event("stats", **rec)
     for a in arms:
         a.err_max, a.err_dir = [0.0] * 9, [0.0] * 9
         a.ripple_sum, a.ripple_n = [0.0] * 9, 0
-        a.play_max = [0.0] * 9
     log.flush()
     parts = [f"{rec['hz']:6.1f} Hz", f"p99 {rec['p99_period_ms']:.2f} ms", f"max {rec['max_period_ms']:.2f}",
              f"work p99 {rec['p99_work_ms']:.2f}", f"on-time {on_time * 100:.2f}%", f"overruns {overruns}"]

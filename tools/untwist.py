@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Live 'how far from normal' readout while you turn an arm's joints BY HAND (motors stay off, nothing moves).
 
-  ssh -t umi001 'cd ~/teleop_openarm_system && python3 tools/untwist.py left'
+  on the Pi, in the repository:  python3 tools/untwist.py left [seconds, default 180]
 Each number is degrees away from the normal hanging pose; turn that joint until it is near 0. If a number grows,
-you are turning the wrong way. A joint far outside its range ('!') makes the motor loop refuse to power on.
-Only while the motor loop is NOT running (it owns the bus).
+you are turning the wrong way. '!' marks a joint outside its allowed range; one far outside it makes the motor loop
+refuse to power on. Only while the motor loop is NOT running (it owns the bus).
 """
 import os
 import socket
@@ -20,8 +20,6 @@ import kinematics as kin  # noqa: E402
 
 BUS = {"right": "can0", "left": "can1"}
 NORMAL_MODEL_DEG = {"right": [0, 0, 0, 0, 90, 0, 0], "left": [0, 0, 0, 0, -90, 0, 0]}  # hanging straight down
-NAMES = ["J1 shoulder fwd/back", "J2 shoulder out/in", "J3 upper-arm twist", "J4 elbow", "J5 forearm twist",
-         "J6 wrist bend", "J7 wrist turn"]
 
 
 def read_arm(s):
@@ -42,8 +40,11 @@ def read_arm(s):
 
 def main():
     arm = sys.argv[1] if len(sys.argv) > 1 else "left"
+    if arm not in BUS:
+        sys.exit(__doc__)
     seconds = float(sys.argv[2]) if len(sys.argv) > 2 else 180
-    if subprocess.run(["pgrep", "-f", "^.venv/bin/python pi/motor_loop.py"], capture_output=True).returncode == 0:
+    # pi/motor_loop.py under any python, by relative or absolute path (the gain-tuning tool starts it by absolute path)
+    if subprocess.run(["pgrep", "-f", "^[^ ]*python[^ ]* [^ ]*pi/motor_loop.py"], capture_output=True).returncode == 0:
         sys.exit("the motor loop is running: stop it first (Y on the headset, or Ctrl-C it)")
     c = kin.load_calib()[arm]
     lim = np.degrees(c["limits"])

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Find where each wrist joint really ends, gently, with its own motor; with --save, write those ranges to
 pi/calib.json so teleop can use every joint all the way to its real end.
-  (motor_loop.py running with the arm ON and hanging still, teleop_server.py NOT running: one brain at a time)
+  (motor_loop.py running with the arm on and hanging still; teleop_server.py stopped: one program sends targets)
   .venv/bin/python tools/find_stops.py right,left --save
 One joint at a time (J7 wrist turn, J6 wrist bend, J5 forearm twist), each way from where it is now: turn slowly
 (14 deg/s) toward the robot's designed end. Stop when 3 telemetry frames in a row show it touching something (the
@@ -29,8 +29,8 @@ FRAMES = 3  # consecutive telemetry frames that must agree before a sweep stops
 MIN_TRAVEL = math.radians(5.0)  # trips this close to the start are ignored (the start's own settling)
 BACKOFF = math.radians(2.0)
 KEEP = 2.0  # deg kept from a real end in the saved range
-# the robot's designed travel (model deg): J6/J7 from the model; J5 the model's +-90 about its MOTOR's zero (on this
-# rig the hanging rest is 14-20 deg off it; 2026-10-21 both forearms met a real end at motor -91.5 deg)
+# the robot's designed travel (model deg): J6/J7 from the model; J5 the model's +-90 about its MOTOR's zero (measured:
+# the hanging rest sits 14-20 deg off that zero, and both forearms met a real end at motor -91.5 deg)
 DESIGN = {6: (-45.0, 45.0), 7: (-90.0, 90.0)}
 NAMES = {5: "J5 forearm twist", 6: "J6 wrist bend", 7: "J7 wrist turn"}
 
@@ -55,7 +55,7 @@ class Link:
         try:
             self.tel.bind(("127.0.0.1", tel_port))
         except OSError:
-            sys.exit("telemetry port busy: stop teleop_server.py first (one brain at a time)")
+            sys.exit("telemetry port busy: stop teleop_server.py first (one program sends targets at a time)")
         self.tel.settimeout(1.0)
         self.out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.t, self.fresh, self.rx_t = None, False, 0.0
@@ -75,9 +75,14 @@ class Link:
             pass
         self.tel.settimeout(1.0)
         if m is None and wait:
-            m = json.loads(self.tel.recv(65536))
+            try:
+                m = json.loads(self.tel.recv(65536))
+            except TimeoutError:
+                sys.exit("no telemetry from the motor loop: is it running?")
         self.fresh = m is not None
         if m is not None:
+            if self.arm not in m["arms"]:
+                sys.exit(f"the motor loop is not driving the {self.arm} arm")
             self.t, self.rx_t = m["arms"][self.arm], time.monotonic()
         return self.t
 
@@ -162,24 +167,27 @@ def sweep(link, c, j, end_model_deg):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("arms", help="right, left or right,left")
-    ap.add_argument("--joints", default="7,6,5")
+    ap.add_argument("--joints", default="7,6,5", help="joints to sweep, in this order (from 5, 6, 7)")
     ap.add_argument("--save", action="store_true", help="write the ranges found to pi/calib.json")
     ap.add_argument("--loop-port", type=int, default=47001)
     ap.add_argument("--tel-port", type=int, default=47002)
     a = ap.parse_args()
+    arms, order = a.arms.split(","), [int(v) for v in a.joints.split(",")]
+    if not set(arms) <= {"left", "right"} or not set(order) <= set(NAMES):  # checked before anything moves
+        ap.error("arms: right, left or right,left; joints: from 5, 6, 7")
     found, ok = {}, True
-    for arm in a.arms.split(","):
+    for arm in arms:
         c = kin.load_calib()[arm]
         link = Link(arm, a.loop_port, a.tel_port)
         q_start = link.q.copy()
         x = np.degrees(kin.to_model(c, link.q))
         if abs(x[0]) > 15 or abs(x[1]) > 15 or x[3] > 25:
             sys.exit(f"{arm}: the arm isn't hanging straight (shoulder {x[0]:.0f}/{x[1]:.0f}, elbow {x[3]:.0f} deg); "
-                     "STOP parks it")
+                     "STOP parks it at its power-on pose")
         print(f"{arm} arm: finding the wrist's real ends (each joint slowly each way, then back)", flush=True)
         found[arm] = {}
         try:
-            for j in (int(v) for v in a.joints.split(",")):
+            for j in order:
                 lo_d, hi_d = design(c, j)
                 res = []
                 for end in (hi_d, lo_d):
@@ -199,7 +207,7 @@ def main():
                 print(f"  -> {NAMES[j]} range {found[arm][j][0]:+.1f} .. {found[arm][j][1]:+.1f} deg "
                       f"(was {old[0]:+.1f} .. {old[1]:+.1f})", flush=True)
         except (Abort, KeyboardInterrupt) as e:
-            print(f"  stopped early: {e or 'Ctrl-C'}", flush=True)
+            print(f"  stopped early: {str(e) or 'Ctrl-C'}", flush=True)
             ok = False
             if isinstance(e, KeyboardInterrupt):
                 try:
@@ -218,6 +226,7 @@ def main():
             lim = raw[arm].setdefault("limits_deg", {})
             for j, r in joints.items():
                 lim[str(j)] = r
+            raw[arm].setdefault("notes", "")
             raw[arm]["notes"] += f" {time.strftime('%Y-%m-%d %H:%M')} find_stops: " + ", ".join(
                 f"J{j} {r[0]:+.1f}..{r[1]:+.1f}" for j, r in sorted(joints.items())) + "."
         tmp = kin.CALIB_PATH + ".tmp"

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Find one gripper's two hard stops with a gentle push (MIT, KP 8, command kept within 0.1 rad of the
 position, so under ~1 Nm). Only the gripper motor is switched on; the rest of the arm stays off.
-  sudo .venv/bin/python tools/grip_stops.py left
-Moves toward + until it stalls, then toward -, then back to where it started, then switches off.
+  sudo .venv/bin/python tools/grip_stops.py left [lead]       (motor_loop.py stopped: it owns the bus)
+Moves toward + until it stalls, then toward -, then back to where it started, then switches off. lead: rad the
+command may run ahead of the position (default 0.1); the push is at most KP x lead Nm.
 """
 import fcntl
 import os
@@ -19,6 +20,8 @@ STALL_S, MAX_TRAVEL, MAX_S = 0.5, 4.0, 15.0
 
 
 def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in ARM_BUS:
+        sys.exit(__doc__)
     arm = sys.argv[1]
     bus = ARM_BUS[arm]
     lockf = open(f"/run/lock/openarm-{bus}.lock", "w")
@@ -57,7 +60,7 @@ def main():
                 r = xfer(dm.mit(t, 0, KP, KD, 0, vmax, tmax))
                 if r is None:
                     continue
-                st, pos, vel, tau = r[:4]
+                st, pos, _, tau = r[:4]
                 if st != 1:
                     raise RuntimeError(f"gripper state {dm.status_name(st)}")
                 now = time.monotonic()

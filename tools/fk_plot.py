@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Draw both arms as the model sees them (front, side, top), to compare with photos of the real rig. Runs on the Mac.
+"""Draw both arms as the model sees them (front, side, top), to compare with photos of the real robot. No robot needed.
   python3 tools/fk_plot.py out.png --q-left "deg x8" --q-right "deg x8" [--calib pi/calib.json] [--sign-right 1,1,-1,...]
+Joint angles are motor degrees, J1..J7 (an 8th value, the gripper, is ignored).
 """
 import argparse
 import os
@@ -27,15 +28,15 @@ def chain_points(arm, c, q):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("out")
     ap.add_argument("--q-left", required=True)
     ap.add_argument("--q-right", required=True)
     ap.add_argument("--calib", default=kin.CALIB_PATH)
-    ap.add_argument("--sign-left")
-    ap.add_argument("--sign-right")
-    ap.add_argument("--offset-left")
-    ap.add_argument("--offset-right")
+    ap.add_argument("--sign-left", help="7 comma-separated signs, replacing calib.json's (to try a sign change)")
+    ap.add_argument("--sign-right", help="same, right arm")
+    ap.add_argument("--offset-left", help="7 comma-separated offsets in degrees, replacing calib.json's")
+    ap.add_argument("--offset-right", help="same, right arm")
     ap.add_argument("--title", default="")
     a = ap.parse_args()
     calib = kin.load_calib(a.calib)
@@ -46,10 +47,10 @@ def main():
             calib[arm]["offset"] = np.radians([float(v) for v in getattr(a, f"offset_{arm}").split(",")])
     q = {arm: np.radians([float(v) for v in getattr(a, f"q_{arm}").replace(",", " ").split()])[:7] for arm in ("left", "right")}
     fig, axes = plt.subplots(1, 3, figsize=(15, 5.5))
-    views = [("FRONT (looking at the robot's face: robot-left on YOUR right)", 1, 2, False),
-             ("SIDE (from the robot's right: forward = to the right)", 0, 2, False),
-             ("TOP (forward = up)", 1, 0, True)]
-    for ax, (title, i, j, flip) in zip(axes, views):
+    views = [("FRONT (looking at the robot's face: robot-left on YOUR right)", 1, 2),
+             ("SIDE (from the robot's right: forward = to the right)", 0, 2),
+             ("TOP (forward = up)", 1, 0)]
+    for ax, (title, i, j) in zip(axes, views):
         for arm, col in (("left", "tab:blue"), ("right", "tab:red")):
             pts, stub = chain_points(arm, calib[arm], q[arm])
             xs, ys = pts[:, i], pts[:, j]
@@ -58,8 +59,6 @@ def main():
                 sx, sy = -stub[1], stub[0]
             else:
                 sx, sy = stub[i], stub[j]
-                if flip:
-                    xs, sx = -xs, -sx
             ax.plot(xs, ys, "-o", color=col, lw=3, ms=5, label=f"{arm} arm")
             ax.plot([xs[-1], sx], [ys[-1], sy], color="k", lw=2)
             ax.annotate("shoulder", (xs[1], ys[1]), fontsize=7)

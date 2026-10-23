@@ -71,15 +71,19 @@ def recv(s):
 
 
 def read_register(s, motor, rid, timeout=0.05, fmt="<f"):
-    """Query a motor register (only while nothing else is talking on this bus). -> value or None."""
+    """Query a motor register (only while nothing else is talking on this bus). -> value, or None if there is no reply
+    or the bus refuses the send (TX queue full: nobody acknowledges)."""
     import time
-    send(s, 0x7FF, bytes([motor, 0, 0x33, rid, 0, 0, 0, 0]))
+    try:
+        send(s, 0x7FF, bytes([motor, 0, 0x33, rid, 0, 0, 0, 0]))
+    except OSError:
+        return None
     deadline = time.monotonic() + timeout
     while (left := deadline - time.monotonic()) > 0:
         s.settimeout(left)
         try:
             can_id, d = recv(s)
-        except (TimeoutError, BlockingIOError):
+        except OSError:  # timeout or bus error
             break
         if not can_id & CAN_ERR_FLAG and d[2] in (0x33, 0x55) and d[0] == motor and d[3] == rid:
             return struct.unpack(fmt, d[4:8])[0]
@@ -89,7 +93,10 @@ def read_register(s, motor, rid, timeout=0.05, fmt="<f"):
 def write_register(s, motor, rid, value, timeout=0.05, fmt="<f"):
     """Write a motor register in RAM only (0x55; lost at power-off, nothing saved to flash: that would need 0xAA,
     which this module never sends). Only while nothing else is talking on this bus. -> value read back, or None."""
-    send(s, 0x7FF, bytes([motor, 0, 0x55, rid]) + struct.pack(fmt, value))
+    try:
+        send(s, 0x7FF, bytes([motor, 0, 0x55, rid]) + struct.pack(fmt, value))
+    except OSError:
+        return None
     import time
     time.sleep(0.002)
     return read_register(s, motor, rid, timeout, fmt)

@@ -4,7 +4,7 @@ set -e
 cd "$(dirname "$0")/.."
 [ -d .venv ] || python3 -m venv --system-site-packages .venv
 .venv/bin/pip install -q aiohttp
-IP=$(ip -4 -br addr show eth0 | awk '{print $3}' | cut -d/ -f1)
+IP=$(hostname -I | awk '{print $1}')
 mkdir -p certs logs
 if [ ! -f certs/cert.pem ] || ! openssl x509 -in certs/cert.pem -noout -text | grep -q "IP Address:$IP"; then
   openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout certs/key.pem -out certs/cert.pem \

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Careful test of one arm's motors' response setting (KP_APR), one setting at a time: by default the two slow motors
+"""Careful test of one arm's motor position-loop gain (KP_APR), one setting at a time: by default the two slow motors
 (J3 upper-arm twist, J4 elbow: DM4340); --joints 1,2 tests the shoulders (DM8009) instead.
 For each setting: start the motor loop with it written to the motors' RAM (motors off; nothing saved, an arm power
 cycle resets it), switch the arm on where it hangs, run a short motion pattern through the loop like the server does,
 measure how far each joint trails and how much it chatters, and stop at once at the first sign of shaking (that
 setting and every stronger one are then skipped). Ends by writing the factory values back.
-  (teleop_server.py and the normal motor loop NOT running; run with sudo: it starts the motor loop)
-  sudo .venv/bin/python tools/tune_elbow.py right [--joints 1,2]
+  (teleop_server.py and any other motor loop stopped; needs sudo, since it starts the motor loop itself)
+  sudo .venv/bin/python tools/tune_gains.py right [--joints 1,2]
 Pattern (~25 s per setting): lift the forearm 20 deg, then for each tested joint two quick 10 deg nods (shoulder:
 forward / outward, never inward) and a 1 Hz wiggle, lower the forearm. The velocity lead is off for the tested joints,
 so 'lag' is the motor's own; the other motors keep the settings in pi/gains.json.
@@ -90,8 +90,8 @@ class Link:
         self.out.sendto(json.dumps({"t": "cmd", "cmd": c, "arm": self.arm}).encode(), ("127.0.0.1", self.loop_port))
 
 
-def pattern(q0, c, arm):
-    """-> list of (duration s, phase, joint index, function u->offset rad) relative to q0 (motor rad)."""
+def pattern(c, arm):
+    """-> list of (duration s, phase, {joint index: function u (0..1) -> offset from the start pose, motor rad})."""
     up, wig = math.radians(20), math.radians(5)
     ease = lambda u: (1 - math.cos(math.pi * u)) / 2  # noqa: E731
     s4 = c["sign"][3]
@@ -100,13 +100,14 @@ def pattern(q0, c, arm):
         i = j - 1
         nod = math.radians(10) * NOD_DIR[arm][j] * c["sign"][i]
         base = {3: lambda u: s4 * up}
+        lift = s4 * up if i == 3 else 0.0  # the elbow nods and wiggles about its lifted angle
         for out in (True, False, True, False):
-            frm, to = (0.0, nod) if out else (nod, 0.0)
+            frm, to = (lift, lift + nod) if out else (lift + nod, lift)
             steps.append((0.5, f"move J{j}", {**base, i: (lambda f, t: lambda u: f + (t - f) * ease(u))(frm, to)}))
             steps.append((1.0, f"hold J{j}", {**base, i: (lambda t: lambda u: t)(to)}))
         j = i  # the wiggle below uses the index
         if j + 1 >= 3:
-            wiggle = lambda u: wig * math.sin(2 * math.pi * 3.0 * u)  # noqa: E731
+            wiggle = (lambda b: lambda u: b + wig * math.sin(2 * math.pi * 3.0 * u))(lift)
         else:  # shoulders: only forward / outward of hanging (0 -> 5 deg -> 0, three times)
             wiggle = (lambda sg: lambda u: sg * wig / 2 * (1 - math.cos(2 * math.pi * 3.0 * u)))(math.copysign(1.0, nod))
         steps.append((3.0, f"sine J{j + 1}", {**base, j: wiggle}))
@@ -123,7 +124,7 @@ def run_setting(link, c, arm, rec):
     if abs(x[0]) > 15 or abs(x[1]) > 15 or x[3] > 25:
         raise Abort(f"the arm isn't hanging straight (shoulder {x[0]:.0f}/{x[1]:.0f}, elbow {x[3]:.0f} deg)")
     win = []
-    for dur, phase, f in pattern(q0, c, arm):
+    for dur, phase, f in pattern(c, arm):
         t0 = time.monotonic()
         while (u := (time.monotonic() - t0) / dur) < 1.0:
             q = q0.copy()
@@ -202,7 +203,8 @@ def metrics(rec):
 
 
 def production(arm):
-    """The arm's settings in pi/gains.json (what teleop uses), or factory: (kp list, acc list, lead list)."""
+    """The arm's settings in pi/gains.json (what teleop uses; without that file: factory gains and the motor loop's
+    default leads) -> (kp list, acc list, lead list)."""
     k, a, lead = [None] * 7, [None] * 7, [180.0, 180.0, 350.0, 350.0, 180.0, 180.0, 180.0]
     path = os.path.join(ROOT, "pi", "gains.json")
     if os.path.exists(path):
@@ -231,7 +233,7 @@ def start_loop(a, path, logf):
     return subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=ROOT)
 
 
-def stop_loop(p, link=None):
+def stop_loop(p):
     if p.poll() is None:
         p.send_signal(signal.SIGINT)  # parks slowly to where it started, then switches off
         try:
@@ -243,12 +245,12 @@ def stop_loop(p, link=None):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("arm")
+    ap.add_argument("arm", choices=("left", "right"))
     ap.add_argument("--settings", default="", help="KP:ACC,KP:ACC,... (default: factory, then gentle steps)")
     ap.add_argument("--joints", default="3,4", help="joints to test: 3,4 (elbow motors) or 1,2 (shoulders)")
     ap.add_argument("--loop-port", type=int, default=47001)
     ap.add_argument("--tel-port", type=int, default=47002)
-    ap.add_argument("--loop-args", default="", help="extra motor_loop.py arguments (simulator: --buses right=vcan2 ...)")
+    ap.add_argument("--loop-args", default="", help="extra motor_loop.py arguments (simulator: --buses right=vcan0)")
     ap.add_argument("--out", default=os.path.join(ROOT, "logs", time.strftime("tune-%Y%m%d-%H%M%S.json")))
     a = ap.parse_args()
     a.loop_args = a.loop_args.split()

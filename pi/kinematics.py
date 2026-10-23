@@ -1,12 +1,11 @@
 """Forward/inverse kinematics for both OpenArm arms (numpy only).
 
-Geometry, axes, limits, TOOL and the posture idea come from Monty's OpenArm retarget,
-itself transcribed from openarm_mujoco v2 openarm_bimanual.xml. Rig frame: x forward, y left, z up, arms
-hanging at model q = 0.
+Geometry, axes, limits and TOOL come from the openarm_mujoco v2 bimanual model (openarm_bimanual.xml).
+Rig frame: x forward, y left, z up, arms hanging at model q = 0.
 
-Motor angles and model angles are related per joint by the calibration (calib.json, measured in S1):
+Motor angles and model angles are related per joint by the calibration (calib.json, measured on the robot):
     q_model = sign * q_motor + offset
-Everything in this module works in MOTOR radians at its interface; the model frame stays inside.
+Joint angles at this module's interface are MOTOR radians (except ik's home posture); the model frame stays inside.
 """
 import json
 import math
@@ -31,11 +30,12 @@ LEFT = [((0.0, 0.0625, 0.0), (0.0, 1.0, 0.0)),  # mirror: y offsets flip, and wi
         ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))]
 CHAIN = {"right": RIGHT, "left": LEFT}
 BASE = {"right": np.array([0.0, -0.031, 0.0]), "left": np.array([0.0, 0.031, 0.0])}
+# joint limits (model rad, right arm; the left mirrors J1 and J2); calib.json's limits_deg override them
 _RL = [(-1.3963, 3.4907), (-0.1745, 3.3161), (-1.5708, 1.5708), (0.0, 2.4435), (-1.5708, 1.5708), (-0.7854, 0.7854), (-1.5708, 1.5708)]
 MODEL_LIMITS = {"right": np.array(_RL), "left": np.array([(-3.4907, 1.3963), (-3.3161, 0.1745)] + _RL[2:])}
 TOOL = np.array([0.0, 0.0, -0.10])  # grasp point in the flange frame
 MARGIN = math.radians(2)  # the IK stays this far inside each joint's limit (limits are the robot's real ends)
-DAMP = 0.05
+DAMP = 0.05  # damped least squares: keeps the IK steps bounded near singularities (e.g. a straight arm)
 
 CALIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib.json")
 
@@ -83,6 +83,7 @@ def rot(axis, t):
 
 
 def quat_to_mat(q):
+    """unit quaternion (x, y, z, w) -> rotation matrix"""
     x, y, z, w = q
     return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
                      [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
@@ -108,24 +109,14 @@ def exp_rot(w):
     return np.eye(3) if th < 1e-12 else rot(w / th, th)
 
 
-def _fk_model_slow(arm, x):
-    """Reference implementation (numpy, readable); _fk_model is the same in plain floats, ~5x faster on the Pi."""
-    R, p, origins, axes = np.eye(3), BASE[arm].copy(), [], []
-    for (xyz, ax), qi in zip(CHAIN[arm], x):
-        p = p + R @ xyz
-        origins.append(p)
-        axes.append(R @ ax)
-        R = R @ rot(ax, qi)
-    return p + R @ TOOL, R, np.array(origins), np.array(axes)
-
-
 # every joint axis is +-x, +-y or +-z: (index, sign) per joint
 _AXIS = {a: [(int(np.argmax(np.abs(ax))), float(np.sign(ax[int(np.argmax(np.abs(ax)))]))) for _, ax in CHAIN[a]] for a in CHAIN}
 _COLS = {0: (1, 2, 1.0), 1: (2, 0, 1.0), 2: (0, 1, 1.0)}  # R @ rot_k(t): columns (i, j) rotate as c*i + s*j, -s*i + c*j
 
 
 def _fk_model(arm, x):
-    """tool position + rotation, and each joint's origin and axis, in the rig frame (model angles)."""
+    """tool position + rotation, and each joint's origin and axis, in the rig frame (model angles).
+    Per joint: p += R @ body_pos, then R = R @ rot(axis, q); written in plain floats, ~5x faster than numpy on a Pi."""
     # columns of R as three [x, y, z] lists
     C = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     px, py, pz = (float(v) for v in BASE[arm])
@@ -162,43 +153,6 @@ def tool_force(arm, c, q_motor, dtau_motor):
     return np.linalg.solve(Jp @ Jp.T + 1e-4 * np.eye(3), Jp @ (c["sign"] * np.asarray(dtau_motor, float)[:7]))
 
 
-def gravity(arm, c, q_motor, theta):
-    """Torque (motor Nm, J1..J7) each motor needs to hold the arm still against gravity, from a weighed model
-    (tools/weigh_arm.py): theta = per link k (frame after joint k) its mass m_k and first moment h_k = m_k * centre of
-    mass (3, link frame), 28 numbers; any per-joint offsets after them are ignored. Plain floats: ~0.1 ms on the Pi."""
-    x = to_model(c, q_motor)
-    C = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-    px, py, pz = (float(v) for v in BASE[arm])
-    o, a, h = [], [], []
-    for k, ((xyz, _), (ax_i, sg), qi) in enumerate(zip(CHAIN[arm], _AXIS[arm], x)):
-        bx, by, bz = xyz
-        px += C[0][0] * bx + C[1][0] * by + C[2][0] * bz
-        py += C[0][1] * bx + C[1][1] * by + C[2][1] * bz
-        pz += C[0][2] * bx + C[1][2] * by + C[2][2] * bz
-        o.append((px, py, pz))
-        ck = C[ax_i]
-        a.append((sg * ck[0], sg * ck[1], sg * ck[2]))
-        i, j, _ = _COLS[ax_i]
-        cs, sn = math.cos(qi), sg * math.sin(float(qi))
-        ci, cj = C[i], C[j]
-        C[i] = [cs * ci[0] + sn * cj[0], cs * ci[1] + sn * cj[1], cs * ci[2] + sn * cj[2]]
-        C[j] = [-sn * ci[0] + cs * cj[0], -sn * ci[1] + cs * cj[1], -sn * ci[2] + cs * cj[2]]
-        m, hx, hy, hz = theta[4 * k: 4 * k + 4]
-        # world first moment of link k about the origin: m * o_k + R_k h_k (columns of R are C[0..2])
-        h.append((m, m * px + C[0][0] * hx + C[1][0] * hy + C[2][0] * hz,
-                  m * py + C[0][1] * hx + C[1][1] * hy + C[2][1] * hz,
-                  m * pz + C[0][2] * hx + C[1][2] * hy + C[2][2] * hz))
-    out = [0.0] * 7
-    M = Sx = Sy = Sz = 0.0
-    for k in range(6, -1, -1):
-        M += h[k][0]; Sx += h[k][1]; Sy += h[k][2]; Sz += h[k][3]
-        ox, oy, oz = o[k]
-        rx, ry, rz = Sx - M * ox, Sy - M * oy, Sz - M * oz  # first moment of links k.. about joint k
-        ax, ay, az = a[k]
-        out[k] = 9.81 * (ax * ry - ay * rx)  # g . (a x r) with g = (0, 0, 9.81): the z component of a x r
-    return [float(t) * float(sg) for t, sg in zip(out, c["sign"])]
-
-
 def elbow_wrist_points(arm, c, q_motor):
     """Joint origins (for calibration plots / checks)."""
     _, _, o, _ = _fk_model(arm, to_model(c, q_motor))
@@ -206,6 +160,7 @@ def elbow_wrist_points(arm, c, q_motor):
 
 
 def _jac(arm, x):
+    """-> (p, R, 6x7 Jacobian of the grasp point: linear rows, then angular), model angles."""
     p, R, o, a = _fk_model(arm, x)
     return p, R, np.vstack([np.cross(a, p - o).T, a.T])
 
@@ -214,31 +169,32 @@ def _jac(arm, x):
 # use the shoulder and elbow like a person does), and the per-step pull toward the home posture
 JOINT_COST = np.array([1.0, 1.0, 3.0, 1.0, 4.0, 4.0, 4.0])
 HOME_PULL = np.array([0.01, 0.01, 0.03, 0.01, 0.3, 0.3, 0.3])
-# home posture (model degrees): the ready pose, forearm forward, elbow 90, wrist at rest. Not the middle of each
-# joint's range: on this rig that is an arm stuck out sideways, and pulling toward it made the arm drift on its own
+# default home posture (model degrees) when the caller gives none: forearm forward, elbow 90, wrist at rest. Not the
+# middle of each joint's range: that is an arm stuck out sideways, and pulling toward it makes the arm drift on its own
 HOME_DEG = {"right": [20, 0, 0, 90, 90, 0, 0], "left": [-20, 0, 0, 90, -90, 0, 0]}
 
 
-def ik(arm, c, want_p, want_R, seed_motor, iters=6, tol=2e-4, rot_weight=0.5, mode="pose", frozen=(), home=None):
-    """Damped least squares from the seed (warm start), limits with a 2 deg margin (widened to admit the seed),
-    then one posture step in the null space. -> (q_motor (7,), residual position error m, residual rotation rad).
+def ik(arm, c, want_p, want_R, seed_motor, iters=6, tol=2e-4, mode="pose", frozen=(), home=None):
+    """One posture step in the null space, then damped least squares from the seed (warm start), MARGIN inside the
+    limits (widened to admit the seed). -> (q_motor (7,), residual position error m, residual rotation rad).
     mode "pose" (teleop default): the grasp point's position first, then its angle with what position leaves free,
     every joint over its full range; a joint that reaches its limit drops out so the others make up for it.
     mode "position": only the grasp point's position is a task; the hand's angle follows the arm.
+    frozen: joints (1-7) the solver must not move (a dead motor).
     home: posture (model rad) the null space is pulled toward, default HOME_DEG; the server passes the pose at the
-    moment of the squeeze, so squeezing alone moves nothing. rot_weight is unused (kept for old callers)."""
+    moment of the squeeze, so squeezing alone moves nothing."""
     if mode == "position":
         return _ik_position(arm, c, want_p, seed_motor, iters, tol, frozen, home)
     return _ik_pose(arm, c, want_p, want_R, seed_motor, iters, tol, frozen, home)
 
 
 # pose mode: per-call pull of the shoulder and elbow toward the home posture, only within what the 6-D task leaves
-# free (the elbow's swing). None on the wrist: pulling it back spread a forearm twist over the shoulder joints
+# free (the elbow's swing). None on the wrist: pulling the wrist back spreads a forearm twist over the shoulder joints
 POSE_PULL = np.array([0.05, 0.05, 0.05, 0.05, 0.0, 0.0, 0.0])
 # pose mode: who does what, like a person: position mostly with the shoulder and elbow, the hand's angle mostly with
 # the wrist (an elbow bend can tilt the hand too, but swings the arm around to keep the grasp point in place)
 W_POS = np.array([1.0, 1.0, 1.0, 1.0, 0.02, 0.02, 0.02])
-# the shoulder never turns the hand: chasing an angle past the wrist's end swung it far out sideways (review 2026-10-21)
+# the shoulder never turns the hand: using it to chase an angle past the wrist's end swings the arm far out sideways
 W_ROT = np.array([0.0, 0.0, 0.0, 0.2, 1.0, 1.0, 1.0])
 ROT_STEP = 0.15  # rad of angle error taken per iteration at most
 
@@ -263,10 +219,10 @@ def _ik_pose(arm, c, want_p, want_R, seed_motor, iters, tol, frozen=(), home=Non
     for j in frozen:  # a dead motor: the solver may not use it
         free0[j - 1] = 0.0
     p, R, J = _jac(arm, x)
-    # posture first, so the iterations below take back any slip it causes (run after them, the slip made the
-    # output cycle every 3 calls with the hand still). home sits a margin inside the limits: from the straight-down
-    # pose this bends the elbow a little, which is what lets the hand go up at all (a straight arm can't move along
-    # itself)
+    # posture first, so the iterations below take back any slip it causes (a posture step after them leaves the slip
+    # in the output, which then cycles with a 3-call period while the hand is still). home sits a margin inside the
+    # limits: from the straight-down pose this bends the elbow a little, which is what lets the hand go up at all (a
+    # straight arm can't move along itself)
     home = np.clip(np.radians(HOME_DEG[arm]) if home is None else home, lim[:, 0] + MARGIN, lim[:, 1] - MARGIN)
     pull = POSE_PULL * (home - x)
     # a joint pressed against its limit can't take part (pulling it out of the limit is fine)
@@ -279,7 +235,7 @@ def _ik_pose(arm, c, want_p, want_R, seed_motor, iters, tol, frozen=(), home=Non
         x, p, R, J = xn, pn, Rn, Jn
     for it in range(iters):
         ep, er = want_p - p, log_rot(want_R @ R.T)
-        # always one correction after the posture step: skipping it when the slip is under tol made a 3-call cycle
+        # always one correction after the posture step: skipping it when the slip is under tol gives a 3-call cycle
         if it and np.linalg.norm(ep) < tol and np.linalg.norm(er) < 5 * tol:
             break
         if (n := np.linalg.norm(er)) > ROT_STEP:

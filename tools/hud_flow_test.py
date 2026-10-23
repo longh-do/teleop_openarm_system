@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Walk the whole operator flow against a running server (simulator) and print what the headset panel would say.
-  .venv/bin/python tools/hud_flow_test.py --url wss://127.0.0.1:8444/ws
+"""Walk the whole operator flow against a running server and print what the headset panel would say after each step.
+  .venv/bin/python tools/hud_flow_test.py [--url wss://127.0.0.1:8444/ws]
 Steps: AR starts -> squeeze before aligning (refused) -> B align -> drive -> release -> Y stop -> thumbstick-hold power on.
+The flow switches the arms on and drives the right arm, so point it at a simulator. The default URL expects a server
+started with --port 8444 (teleop_server.py's own default is 8443).
 """
 import argparse
 import asyncio
@@ -13,7 +15,7 @@ import aiohttp
 
 
 async def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default="wss://127.0.0.1:8444/ws")
     args = ap.parse_args()
     ctx = ssl.create_default_context()
