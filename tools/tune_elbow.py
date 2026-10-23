@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Careful test of the two slow motors (J3 upper-arm twist, J4 elbow: DM4340) on one arm, one setting at a time.
+"""Careful test of one arm's motors' response setting (KP_APR), one setting at a time: by default the two slow motors
+(J3 upper-arm twist, J4 elbow: DM4340); --joints 1,2 tests the shoulders (DM8009) instead.
 For each setting: start the motor loop with it written to the motors' RAM (motors off; nothing saved, an arm power
 cycle resets it), switch the arm on where it hangs, run a short motion pattern through the loop like the server does,
 measure how far each joint trails and how much it chatters, and stop at once at the first sign of shaking (that
 setting and every stronger one are then skipped). Ends by writing the factory values back.
   (teleop_server.py and the normal motor loop NOT running; run with sudo: it starts the motor loop)
-  sudo .venv/bin/python tools/tune_elbow.py right
-Pattern (~25 s per setting): lift the forearm 20 deg, two quick 10 deg elbow nods, a 1 Hz wiggle, the same for the
-upper-arm twist, lower the forearm. The velocity lead is off for J3/J4 here, so 'lag' is the motor's own.
+  sudo .venv/bin/python tools/tune_elbow.py right [--joints 1,2]
+Pattern (~25 s per setting): lift the forearm 20 deg, then for each tested joint two quick 10 deg nods (shoulder:
+forward / outward, never inward) and a 1 Hz wiggle, lower the forearm. The velocity lead is off for the tested joints,
+so 'lag' is the motor's own; the other motors keep the settings in pi/gains.json.
 """
 import argparse
 import json
@@ -27,10 +29,13 @@ import kinematics as kin  # noqa: E402
 
 FACTORY = (54.0, 2.0)  # KP_APR, ACC/DEC as shipped
 SETTINGS = [FACTORY, (54.0, 30.0), (80.0, 30.0), (110.0, 30.0)]  # gentlest first; stop at the first that shakes
-TUNED = (3, 4)
+TUNED = (3, 4)  # set from --joints
 SHAKE_POS = 0.6  # deg peak-to-peak of a held joint over 0.4 s, after removing a smooth (quadratic) glide = shaking
 SHAKE_TAU = 2.5  # Nm peak-to-peak of a held J3/J4 over 0.4 s, after removing a smooth glide = shaking
-SHAKE_TAU_12 = 4.0  # the same for J1/J2 (their settings are not changed; this catches coupling)
+SHAKE_TAU_12 = 4.0  # the same for J1/J2 (the shoulders carry the whole arm: more torque noise)
+# direction of a nod in model degrees, per arm: shoulder J1 forward, J2 outward (never inward), J3 any, J4 bend
+NOD_DIR = {"right": {1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1}, "left": {1: -1, 2: -1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1}}
+SHAKE_TAU_WRIST = 1.0  # Nm for the light wrist motors J5-J7
 FAR = 10.0  # deg behind while moving = give up
 
 
@@ -85,35 +90,40 @@ class Link:
         self.out.sendto(json.dumps({"t": "cmd", "cmd": c, "arm": self.arm}).encode(), ("127.0.0.1", self.loop_port))
 
 
-def pattern(q0, c):
+def pattern(q0, c, arm):
     """-> list of (duration s, phase, joint index, function u->offset rad) relative to q0 (motor rad)."""
-    up, nod, wig = math.radians(20), math.radians(10), math.radians(5)
+    up, wig = math.radians(20), math.radians(5)
     ease = lambda u: (1 - math.cos(math.pi * u)) / 2  # noqa: E731
     s4 = c["sign"][3]
     steps = [(3.0, "move", {3: lambda u: s4 * up * ease(u)}), (1.0, "hold", {3: lambda u: s4 * up})]
-    for j in (3, 2):  # elbow, then upper-arm twist (index)
+    for j in sorted(TUNED, reverse=True):  # e.g. elbow then upper-arm twist, or J2 then J1
+        i = j - 1
+        nod = math.radians(10) * NOD_DIR[arm][j] * c["sign"][i]
         base = {3: lambda u: s4 * up}
-        for sgn in (1, -1, 1, -1):
-            frm, to = (0.0, sgn * nod) if sgn > 0 else (nod, 0.0)
-            if sgn < 0:
-                frm, to = nod, 0.0
-            steps.append((0.5, f"move J{j + 1}", {**base, j: (lambda f, t: lambda u: f + (t - f) * ease(u))(frm, to)}))
-            steps.append((1.0, f"hold J{j + 1}", {**base, j: (lambda t: lambda u: t)(to)}))
-        steps.append((3.0, f"sine J{j + 1}", {**base, j: lambda u: wig * math.sin(2 * math.pi * 3.0 * u)}))
+        for out in (True, False, True, False):
+            frm, to = (0.0, nod) if out else (nod, 0.0)
+            steps.append((0.5, f"move J{j}", {**base, i: (lambda f, t: lambda u: f + (t - f) * ease(u))(frm, to)}))
+            steps.append((1.0, f"hold J{j}", {**base, i: (lambda t: lambda u: t)(to)}))
+        j = i  # the wiggle below uses the index
+        if j + 1 >= 3:
+            wiggle = lambda u: wig * math.sin(2 * math.pi * 3.0 * u)  # noqa: E731
+        else:  # shoulders: only forward / outward of hanging (0 -> 5 deg -> 0, three times)
+            wiggle = (lambda sg: lambda u: sg * wig / 2 * (1 - math.cos(2 * math.pi * 3.0 * u)))(math.copysign(1.0, nod))
+        steps.append((3.0, f"sine J{j + 1}", {**base, j: wiggle}))
         steps.append((0.8, f"hold J{j + 1}", base))
     steps.append((3.0, "move", {3: lambda u: s4 * up * (1 - ease(u))}))
     steps.append((0.5, "hold", {}))
     return steps
 
 
-def run_setting(link, c, kp, acc, rec):
+def run_setting(link, c, arm, rec):
     """Drive the pattern, watching for shaking. -> None, or why it was stopped."""
     q0 = link.q.copy()
     x = np.degrees(kin.to_model(c, q0))
     if abs(x[0]) > 15 or abs(x[1]) > 15 or x[3] > 25:
         raise Abort(f"the arm isn't hanging straight (shoulder {x[0]:.0f}/{x[1]:.0f}, elbow {x[3]:.0f} deg)")
     win = []
-    for dur, phase, f in pattern(q0, c):
+    for dur, phase, f in pattern(q0, c, arm):
         t0 = time.monotonic()
         while (u := (time.monotonic() - t0) / dur) < 1.0:
             q = q0.copy()
@@ -125,7 +135,7 @@ def run_setting(link, c, kp, acc, rec):
                 continue
             now = time.monotonic()
             rec.append({"t": now, "phase": phase, "u": u, "x": t["x"][:7], "q": t["q"][:7], "tau": t["tau"][:7]})
-            lag = [abs(math.degrees(t["q"][i] - t["x"][i])) for i in range(4)]
+            lag = [abs(math.degrees(t["q"][i] - t["x"][i])) for i in range(7)]
             if phase.startswith(("move", "sine")) and max(lag) > FAR:
                 return f"J{int(np.argmax(lag)) + 1} {max(lag):.1f} deg behind"
             if phase.startswith("hold") and u * dur > 0.5:  # later part of a hold: is anything shaking back and forth?
@@ -135,10 +145,10 @@ def run_setting(link, c, kp, acc, rec):
                     Q = np.degrees(np.array([r["q"] for r in win]))
                     T = np.array([r["tau"] for r in win])
                     k = np.arange(len(win))
-                    for i in range(4):  # a joint still gliding into place is a smooth curve: take that out first
+                    for i in range(7):  # a joint still gliding into place is a smooth curve: take that out first
                         q_d = Q[:, i] - np.polyval(np.polyfit(k, Q[:, i], 2), k)
                         tau_d = T[:, i] - np.polyval(np.polyfit(k, T[:, i], 2), k)
-                        lim = SHAKE_TAU if i + 1 in TUNED else SHAKE_TAU_12
+                        lim = SHAKE_TAU if i + 1 in (3, 4) else SHAKE_TAU_12 if i + 1 in (1, 2) else SHAKE_TAU_WRIST
                         if np.ptp(q_d) > SHAKE_POS:
                             return f"J{i + 1} shaking {np.ptp(q_d):.2f} deg"
                         if np.ptp(tau_d) > lim:
@@ -191,12 +201,26 @@ def metrics(rec):
     return out
 
 
-def gains_file(path, kp, acc):
-    k = [None] * 7
-    a = [None] * 7
+def production(arm):
+    """The arm's settings in pi/gains.json (what teleop uses), or factory: (kp list, acc list, lead list)."""
+    k, a, lead = [None] * 7, [None] * 7, [180.0, 180.0, 350.0, 350.0, 180.0, 180.0, 180.0]
+    path = os.path.join(ROOT, "pi", "gains.json")
+    if os.path.exists(path):
+        g = json.load(open(path))
+        g = g.get(arm, g)
+        k = g.get("kp_apr", k)
+        a = g.get("acc", a) if isinstance(g.get("acc", a), list) else [g["acc"]] * 7
+        lead = g.get("lead_ms", lead)
+    return list(k), list(a), list(lead)
+
+
+def gains_file(path, arm, kp, acc):
+    """Tested joints get (kp, acc) and no lead (so the lag measured is the motor's own); the others keep their
+    teleop settings, written explicitly so a power cycle in between can't leave them at something else."""
+    k, a, lead = production(arm)
+    k = [FACTORY[0] if v is None else v for v in k]
     for j in TUNED:
-        k[j - 1], a[j - 1] = kp, acc
-    lead = [180.0, 180.0, 0.0, 0.0, 180.0, 180.0, 180.0]  # J3/J4 lead off: measure the motor itself
+        k[j - 1], a[j - 1], lead[j - 1] = kp, acc, 0.0
     with open(path, "w") as f:
         json.dump({"kp_apr": k, "acc": a, "lead_ms": lead}, f)
 
@@ -221,12 +245,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("arm")
     ap.add_argument("--settings", default="", help="KP:ACC,KP:ACC,... (default: factory, then gentle steps)")
+    ap.add_argument("--joints", default="3,4", help="joints to test: 3,4 (elbow motors) or 1,2 (shoulders)")
     ap.add_argument("--loop-port", type=int, default=47001)
     ap.add_argument("--tel-port", type=int, default=47002)
     ap.add_argument("--loop-args", default="", help="extra motor_loop.py arguments (simulator: --buses right=vcan2 ...)")
     ap.add_argument("--out", default=os.path.join(ROOT, "logs", time.strftime("tune-%Y%m%d-%H%M%S.json")))
     a = ap.parse_args()
     a.loop_args = a.loop_args.split()
+    global TUNED
+    TUNED = tuple(int(v) for v in a.joints.split(","))
     if os.geteuid() != 0:
         sys.exit("run with sudo (it starts the motor loop)")
     if subprocess.run(["pgrep", "-f", r"^\S*python\S* \S*pi/motor_loop.py"], capture_output=True).returncode == 0 and \
@@ -242,13 +269,13 @@ def main():
             if failed:
                 results.append({"kp_apr": kp, "acc": acc, "skipped": "a gentler setting already shook"})
                 continue
-            print(f"--- KP_APR {kp:.0f}, ACC {acc:.0f} on J3/J4 ({a.arm} arm)", flush=True)
-            gains_file(path, kp, acc)
+            print(f"--- KP_APR {kp:.0f}, ACC {acc:.0f} on J{'/J'.join(map(str, TUNED))} ({a.arm} arm)", flush=True)
+            gains_file(path, a.arm, kp, acc)
             p = start_loop(a, path, logf)
             rec, why = [], None
             try:
                 link.wait_on(15)
-                why = run_setting(link, c, kp, acc, rec)
+                why = run_setting(link, c, a.arm, rec)
             except Abort as e:
                 why = str(e)
             if why:
@@ -265,8 +292,9 @@ def main():
     except KeyboardInterrupt:
         print("Ctrl-C", flush=True)
     finally:
-        print("--- writing the factory values back (KP_APR 54, ACC 2): the arm switches on and off where it hangs", flush=True)
-        gains_file(path, *FACTORY)
+        print(f"--- writing the factory values back to J{'/J'.join(map(str, TUNED))} (KP_APR 54, ACC 2), the others keep "
+              "their teleop settings: the arm switches on and off where it hangs", flush=True)
+        gains_file(path, a.arm, *FACTORY)
         p = start_loop(a, path, logf)
         try:
             link.wait_on(15)

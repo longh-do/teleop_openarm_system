@@ -1,14 +1,14 @@
 {
- "_note": "Written to the motors' RAM at every start and power-on (never to flash). J3/J4 (DM4340) only: KP_APR 54 -> 250 cut their own lag 450 -> 140 ms with no shaking (tools/tune_elbow.py, 2026-10-22, both arms); lead_ms J3/J4 = that lag. null = leave the motor's value alone. Never raise J1/J2 (DM8009): KP 150 made the left shoulders shake on 2026-10-21.",
+ "_note": "Written to the motors' RAM at every start and power-on (never to flash). 2026-10-22: the cup-session motor settings (J1/J2 factory 54, J3/J4 250, wrist factory 54), written explicitly so a test's leftover RAM value can't stay. lead_ms: how far ahead the loop aims to cancel each motor's lag. J1/J2 180 -> 80 ms: with 180 the shoulders' command->motion gain rose to 1.6-2.1x near 3 Hz (no lead: <= 0.95x), so the arm rang, worst with it straight. Measured with 80: peak 0.94-1.05x (right J2 1.25x), delay at 1 Hz 18 -> 64 ms. Elbow and wrist responses are flat (peak 1.00-1.05x) and keep their leads (TRACKER D15).",
  "right": {
   "kp_apr": [
-   null,
-   null,
+   54.0,
+   54.0,
    250.0,
    250.0,
-   null,
-   null,
-   null
+   54.0,
+   54.0,
+   54.0
   ],
   "acc": [
    null,
@@ -20,8 +20,8 @@
    null
   ],
   "lead_ms": [
-   180.0,
-   180.0,
+   80.0,
+   80.0,
    140.0,
    140.0,
    180.0,
@@ -31,13 +31,13 @@
  },
  "left": {
   "kp_apr": [
-   null,
-   null,
+   54.0,
+   54.0,
    250.0,
    250.0,
-   null,
-   null,
-   null
+   54.0,
+   54.0,
+   54.0
   ],
   "acc": [
    null,
@@ -49,8 +49,8 @@
    null
   ],
   "lead_ms": [
-   180.0,
-   180.0,
+   80.0,
+   80.0,
    140.0,
    140.0,
    180.0,

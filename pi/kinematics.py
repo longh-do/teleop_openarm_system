@@ -162,6 +162,43 @@ def tool_force(arm, c, q_motor, dtau_motor):
     return np.linalg.solve(Jp @ Jp.T + 1e-4 * np.eye(3), Jp @ (c["sign"] * np.asarray(dtau_motor, float)[:7]))
 
 
+def gravity(arm, c, q_motor, theta):
+    """Torque (motor Nm, J1..J7) each motor needs to hold the arm still against gravity, from a weighed model
+    (tools/weigh_arm.py): theta = per link k (frame after joint k) its mass m_k and first moment h_k = m_k * centre of
+    mass (3, link frame), 28 numbers; any per-joint offsets after them are ignored. Plain floats: ~0.1 ms on the Pi."""
+    x = to_model(c, q_motor)
+    C = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    px, py, pz = (float(v) for v in BASE[arm])
+    o, a, h = [], [], []
+    for k, ((xyz, _), (ax_i, sg), qi) in enumerate(zip(CHAIN[arm], _AXIS[arm], x)):
+        bx, by, bz = xyz
+        px += C[0][0] * bx + C[1][0] * by + C[2][0] * bz
+        py += C[0][1] * bx + C[1][1] * by + C[2][1] * bz
+        pz += C[0][2] * bx + C[1][2] * by + C[2][2] * bz
+        o.append((px, py, pz))
+        ck = C[ax_i]
+        a.append((sg * ck[0], sg * ck[1], sg * ck[2]))
+        i, j, _ = _COLS[ax_i]
+        cs, sn = math.cos(qi), sg * math.sin(float(qi))
+        ci, cj = C[i], C[j]
+        C[i] = [cs * ci[0] + sn * cj[0], cs * ci[1] + sn * cj[1], cs * ci[2] + sn * cj[2]]
+        C[j] = [-sn * ci[0] + cs * cj[0], -sn * ci[1] + cs * cj[1], -sn * ci[2] + cs * cj[2]]
+        m, hx, hy, hz = theta[4 * k: 4 * k + 4]
+        # world first moment of link k about the origin: m * o_k + R_k h_k (columns of R are C[0..2])
+        h.append((m, m * px + C[0][0] * hx + C[1][0] * hy + C[2][0] * hz,
+                  m * py + C[0][1] * hx + C[1][1] * hy + C[2][1] * hz,
+                  m * pz + C[0][2] * hx + C[1][2] * hy + C[2][2] * hz))
+    out = [0.0] * 7
+    M = Sx = Sy = Sz = 0.0
+    for k in range(6, -1, -1):
+        M += h[k][0]; Sx += h[k][1]; Sy += h[k][2]; Sz += h[k][3]
+        ox, oy, oz = o[k]
+        rx, ry, rz = Sx - M * ox, Sy - M * oy, Sz - M * oz  # first moment of links k.. about joint k
+        ax, ay, az = a[k]
+        out[k] = 9.81 * (ax * ry - ay * rx)  # g . (a x r) with g = (0, 0, 9.81): the z component of a x r
+    return [float(t) * float(sg) for t, sg in zip(out, c["sign"])]
+
+
 def elbow_wrist_points(arm, c, q_motor):
     """Joint origins (for calibration plots / checks)."""
     _, _, o, _ = _fk_model(arm, to_model(c, q_motor))

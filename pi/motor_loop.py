@@ -26,6 +26,7 @@ import math
 import os
 import signal
 import socket
+import struct
 import sys
 import time
 
@@ -40,7 +41,9 @@ JOINTS = range(1, 9)
 # (S1: J4 fell 8.6 deg behind at 0.6 rad/s with only 2.8 Nm load), so they get lower limits
 # 2026-10-22: J3/J4 0.6 -> 0.9 rad/s, 3 -> 4 rad/s^2 (the user felt the arm trailing; the lead now covers their lag)
 VMAX = {1: 1.0, 2: 1.0, 3: 0.9, 4: 0.9, 5: 2.0, 6: 2.0, 7: 2.0, 8: 3.0}  # rad/s
-AMAX = {1: 4.0, 2: 4.0, 3: 4.0, 4: 4.0, 5: 4.0, 6: 4.0, 7: 4.0, 8: 12.0}  # rad/s^2
+# wrist J5-J7 4 -> 20 rad/s^2 (2026-10-22): quick hand twists reverse the wrist faster than 4 allowed, the follower ran
+# 29 deg behind the target and the jump guard refused it ("too sudden"); the wrist motors carry only the gripper
+AMAX = {1: 4.0, 2: 4.0, 3: 4.0, 4: 4.0, 5: 20.0, 6: 20.0, 7: 20.0, 8: 12.0}  # rad/s^2
 PARK_V, PARK_A = 0.3, 1.0
 # Nm, sustained -> hold. Raised 2026-10-22 (was 15/15/10/10/4/4/4): pushing a plug into the adapter needs a firm push,
 # and the lower values paused the arm halfway (the user accepts the stronger pushes)
@@ -93,6 +96,10 @@ class Arm:
         self.v_lp, self.lead_scale, self.lead_want = [0.0] * n, 1.0, 1.0
         self.tau_prev, self.ripple_sum, self.ripple_n = [None] * n, [0.0] * n, 0  # buzz detector
         self.late = [0] * n  # replies that arrived after the reply timeout, per joint
+        # gear play (--watch-output): the reported position comes from the rotor sensor (before the gearbox); register
+        # 0x51 is the output-shaft sensor. Their difference, minus its value at start, is how far the link sits off
+        # the rotor's idea of it: play/backlash and flex in the gearbox
+        self.xout_off, self.play, self.play_max, self.watch_i = [None] * n, [0.0] * n, [0.0] * n, 0
         self.tx_full = 0  # sends refused because the bus is not acknowledging
         self.limits = None  # motor-space (lo, hi) per joint 1-7 when calibration is verified
 
@@ -201,6 +208,14 @@ class Arm:
                 except OSError:  # TX queue full: nobody acknowledges (arm power off / cable out). Don't crash.
                     self.tx_full += 1
                     break
+        watch = self.args.watch_list
+        if watch and self.mode not in ("off",) and not self.tx_full:  # one output-sensor read per cycle, in turn
+            jw = watch[self.watch_i % len(watch)]
+            self.watch_i += 1
+            try:
+                dm.send(s, 0x7FF, bytes([jw, 0, 0x33, 0x51, 0, 0, 0, 0]))
+            except OSError:
+                pass
         deadline = t0 + timeout
         while got & self.want != self.want:
             left = deadline - time.monotonic()
@@ -225,6 +240,13 @@ class Arm:
         if d[1] == 0 and d[2] in (0x33, 0x55):
             # a register reply ([id, 0, 0x33/0x55, rid, value]) left in the queue, not feedback: reading it as a
             # position would say "-12.49 rad" and preload a garbage target. Real joints never sit near -PMAX.
+            if d[2] == 0x33 and d[3] == 0x51 and self.seen[j]:  # output-shaft angle: gear play vs the rotor's angle
+                xo = struct.unpack("<f", d[4:8])[0]
+                diff = math.remainder(xo - self.pos[j], 2 * math.pi)
+                if self.xout_off[j] is None:
+                    self.xout_off[j] = diff
+                self.play[j] = math.remainder(diff - self.xout_off[j], 2 * math.pi)
+                self.play_max[j] = max(self.play_max[j], abs(self.play[j]))
             return 0
         st, p, v, t, tm, tr = dm.decode(d, self.vmax_reg[j], self.tmax_reg[j])
         self.state[j], self.pos[j], self.vel[j], self.tau[j], self.temp[j] = st, p, v, t, max(tm, tr)
@@ -475,7 +497,8 @@ class Arm:
         return {"mode": self.mode, "reason": self.reason, "epoch": self.epoch, "buzz": self.buzz, "skip": sorted(self.skip),
                 "x": r(self.x), "q": r(self.pos), "tau": [round(self.tau[j], 2) for j in JOINTS],
                 "st": self.state[1:], "temp": self.temp[1:], "stale": [self.gap_start[j] is not None for j in JOINTS],
-                "misses": self.misses[1:], "can_errors": self.can_errors}
+                "misses": self.misses[1:], "can_errors": self.can_errors,
+                "play": [round(self.play[j], 5) for j in JOINTS]}
 
     def disable_now(self):
         for _ in range(3):
@@ -575,6 +598,8 @@ def main():
     ap.add_argument("--motor-speed-scale-34", type=float, default=1.0,
                     help="extra x for J3/J4 only: posvel speed headroom so the sluggish DM4340s can catch up (test 1.5)")
     ap.add_argument("--grip-torque", type=float, default=GRIP_TORQUE, help="Nm: the grippers' strongest squeeze")
+    ap.add_argument("--watch-output", default="", help="joints whose output-shaft sensor is read in turn, e.g. 1,2,3,4 "
+                    "(gear play shows as play_deg in the stats and 'play' in telemetry)")
     ap.add_argument("--park-timeout", type=float, default=30)
     ap.add_argument("--read-only", action="store_true", help="never enable; print angles once a second")
     ap.add_argument("--test", choices=["none", "hold", "sine", "probe"], default="none")
@@ -617,6 +642,7 @@ def main():
                                     "acc": [args.acc] * 7 if args.acc is not None else base["acc"]}
     if args.lead:
         args.lead_list = {arm_name: seven(args.lead) for arm_name in ("right", "left")}
+    args.watch_list = [int(v) for v in args.watch_output.split(",") if v]
     names = [a.strip() for a in args.arms.split(",") if a.strip()]
     assert all(n in ARM_BUS for n in names), f"--arms must be from {list(ARM_BUS)}"
     other = None if all(ARM_BUS[n].startswith("vcan") for n in names) else find_other_writer()
@@ -855,12 +881,14 @@ def stats(args, arms, periods, works, late, overruns, log, span, t_start):
                              "err_deg": [round(math.degrees(e), 2) for e in a.err_max[1:8]],
                              "err_dir_deg": [round(math.degrees(e), 2) for e in a.err_dir[1:8]],
                              "ripple": [round(math.sqrt(a.ripple_sum[j] / a.ripple_n), 3) if a.ripple_n else 0.0 for j in range(1, 8)],
+                             "play_deg": [round(math.degrees(a.play_max[j]), 3) for j in range(1, 8)],
                              "max_tau": [round(a.tau[j], 1) for j in JOINTS],
                              "temp": a.temp[1:]} for a in arms}}
     log.event("stats", **rec)
     for a in arms:
         a.err_max, a.err_dir = [0.0] * 9, [0.0] * 9
         a.ripple_sum, a.ripple_n = [0.0] * 9, 0
+        a.play_max = [0.0] * 9
     log.flush()
     parts = [f"{rec['hz']:6.1f} Hz", f"p99 {rec['p99_period_ms']:.2f} ms", f"max {rec['max_period_ms']:.2f}",
              f"work p99 {rec['p99_work_ms']:.2f}", f"on-time {on_time * 100:.2f}%", f"overruns {overruns}"]
