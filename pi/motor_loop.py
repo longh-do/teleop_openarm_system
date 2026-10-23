@@ -63,6 +63,14 @@ def clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
 
+def finite(v):
+    """A JSON number that fits a float (an integer too large for a float overflows math.isfinite)."""
+    try:
+        return isinstance(v, (int, float)) and math.isfinite(v)
+    except OverflowError:
+        return False
+
+
 class Arm:
     def __init__(self, name, args, calib, skip=()):
         self.name, self.bus, self.args = name, ARM_BUS[name], args
@@ -369,8 +377,7 @@ class Arm:
         if self.mode != "on" or msg.get("epoch") != self.epoch:
             return
         q = msg.get("q")
-        if not isinstance(q, list) or len(q) != 7 or \
-                not all(isinstance(v, (int, float)) and math.isfinite(v) for v in q):
+        if not isinstance(q, list) or len(q) != 7 or not all(finite(v) for v in q):
             return
         worst = max(range(7), key=lambda i: abs(q[i] - self.x[i + 1]))
         if abs(q[worst] - self.x[worst + 1]) > JUMP_GUARD:
@@ -378,7 +385,7 @@ class Arm:
         if self.limits is not None:
             q = [clamp(v, *self.limits[i]) for i, v in enumerate(q)]
         g = msg.get("g")
-        goal = list(q) + [g if isinstance(g, (int, float)) and math.isfinite(g) else self.goal[8]]
+        goal = list(q) + [g if finite(g) else self.goal[8]]
         if self.calib.get("grip"):
             lo, hi = sorted((self.calib["grip"]["open"], self.calib["grip"]["closed"]))
             goal[7] = clamp(goal[7], lo, hi)
@@ -393,7 +400,7 @@ class Arm:
             if j not in self.skip:
                 self.goal[j] = goal[j - 1]
         lead = msg.get("lead", 1.0)
-        self.lead_want = clamp(float(lead), 0.0, 1.0) if isinstance(lead, (int, float)) and math.isfinite(lead) else 1.0
+        self.lead_want = clamp(float(lead), 0.0, 1.0) if finite(lead) else 1.0
         if not self.brain_live:
             self.reason = "following the brain"
         self.target_prev, self.target_t, self.brain_live = goal, now, True
@@ -531,7 +538,7 @@ def find_other_writer():
                 continue
             if not os.path.basename(argv[0]).startswith("python"):
                 continue  # shells and sudo merely mention the name
-            if any(a.endswith(("teleop_web.py", "motor_loop.py")) for a in argv[1:3]):
+            if any(a.endswith("motor_loop.py") for a in argv[1:3]):
                 if sim_only(argv):
                     continue  # a simulator run: every arm it drives is on a virtual (vcan) bus
                 return pid, " ".join(argv).strip()
@@ -713,7 +720,7 @@ def main():
                     break
                 try:
                     msg = json.loads(data)
-                except ValueError:
+                except (ValueError, RecursionError):  # not JSON, or nested too deep
                     continue
                 if not isinstance(msg, dict):
                     continue

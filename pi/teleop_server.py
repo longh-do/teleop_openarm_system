@@ -55,9 +55,9 @@ LOOP_VMAX = np.array([1.0, 1.0, 0.9, 0.9, 2.0, 2.0, 2.0])
 GRIP_CATCH = 0.05  # rad: after a squeeze the gripper waits until the trigger comes this close to its current opening
 # an angle the wrist can't reach: the target stays at most this far past where the gripper got (see drive)
 ROT_SLIP = math.radians(5)
-# on release, a joint this far from its command is pressing on something (or still moving): it holds where it really
-# is, this much back from where it was pushing (see ArmBrain.settle)
-RELEASE_GAP, RELEASE_BACKOFF = math.radians(0.5), math.radians(0.5)
+# on release, a joint at least RELEASE_GAP short of its command and slower than RELEASE_STILL (rad/s) is pressing on
+# something: it holds where it really is, RELEASE_BACKOFF back from where it was pushing (see ArmBrain.release)
+RELEASE_GAP, RELEASE_STILL, RELEASE_BACKOFF = math.radians(0.5), 0.05, math.radians(0.2)
 JOINT_NAMES = ["shoulder (fwd/back)", "shoulder (out/in)", "upper-arm twist", "elbow", "forearm twist", "wrist bend",
                "wrist turn"]
 
@@ -156,10 +156,13 @@ class ArmBrain:
         self.push_ref = None  # joint torques before the push (gravity), where and when they were taken
         self.push_f = np.zeros(3)  # estimated force the gripper presses with while sliding (N, robot frame, smoothed)
         self.push_now = 0.0  # ...along the direction it is sliding (for the headset panel)
+        self.qd = np.zeros(7)  # measured joint speeds (motor rad/s), from the last two telemetry frames
 
     def on_tel(self, t, now):
         """New telemetry. If the loop reset its follower (epoch changed), re-sync and drop the clutch."""
         first = self.tel is None
+        if not first and 0.0 < now - self.tel_t < 0.2:
+            self.qd = (np.array(t["q"][:7]) - np.array(self.tel["q"][:7])) / (now - self.tel_t)
         self.tel, self.tel_t = t, now
         if t["epoch"] != self.epoch:
             self.epoch = t["epoch"]
@@ -167,6 +170,9 @@ class ArmBrain:
             self.g_cmd = t["x"][7]
             was = self.engaged
             self.engaged, self.anchor = False, None
+            if not first and t["buzz"] != self.last_buzz:  # a hold or fault: reported once, as the buzz
+                self.last_buzz = t["buzz"]
+                return "buzz"
             if was:
                 return "resync"
         if first:
@@ -308,29 +314,34 @@ class ArmBrain:
             if res_p > 0.005 or res_r > math.radians(3) else []
         if res_p > 0.01:  # unreachable: stop the commanded pose running away from the arm
             self.ee_p, self.ee_R = kin.fk(self.name, self.calib, q)
-            a["E0R"] = turn.T @ self.ee_R  # and the angle too (see below)
             self.ee_v = np.zeros(3)
             return "limit"
-        # an angle the joints can't reach: buzz, and drop what is past the wrist's end (the target stays at most
-        # ROT_SLIP past where the gripper got), so the gripper stops there and turns back as soon as the hand does.
-        # A target kept in full keeps growing, and the IK chases it with detours (forearm twists, wrist swings) that
-        # can tip the gripper the opposite way to the hand
-        if res_r > ROT_SLIP and not self.lock:
+        # an angle the arm can't reach where the grasp point is (a wrist joint at its end, or a straight arm): buzz, and
+        # drop the excess (the target stays at most ROT_SLIP past where the gripper got), so the gripper stops there and
+        # turns back as soon as the hand does. A target kept in full keeps growing, and the IK chases it with detours
+        # (forearm twists, wrist swings) that can tip the gripper the opposite way to the hand. While the grasp point
+        # itself is out of reach the angle target is kept, so the gripper's angle matches again once it is back in reach
+        if res_r > ROT_SLIP and res_p < 0.005 and not self.lock:
             R_now = kin.fk(self.name, self.calib, q)[1]
             w = kin.log_rot(self.ee_R @ R_now.T)
             self.ee_R = kin.exp_rot(w * (ROT_SLIP / float(np.linalg.norm(w)))) @ R_now
             a["E0R"] = turn.T @ self.ee_R  # the hand's next turns start from here
         return "limit" if res_r > math.radians(3) or slide_hit else None
 
-    def settle(self):
-        """On release: hold where the arm really is, a little back from anything it presses on. Holding the last
-        command keeps a blocked joint pushing ever harder (the motor's speed loop winds up against the obstacle), up to
-        ~30 Nm on a shoulder within 1-2 s, enough to dip the motors' supply and reboot them."""
+    def release(self):
+        """Stop driving this arm. A joint pressing on something holds where it really is, a little back from it: holding
+        the last command keeps a blocked joint pushing ever harder (the motor's speed loop winds up against the
+        obstacle), up to ~30 Nm on a shoulder within 1-2 s, enough to dip the motors' supply and reboot them. A joint
+        still moving keeps its command and lands on it."""
+        if not self.engaged:
+            return
+        self.engaged = False
         if self.tel is None or self.q_cmd is None:
             return
         q = np.array(self.tel["q"][:7])
         d = self.q_cmd - q  # where each motor was pushing
-        self.q_cmd = np.where(np.abs(d) > RELEASE_GAP, q - np.sign(d) * RELEASE_BACKOFF, self.q_cmd)
+        press = (np.abs(d) > RELEASE_GAP) & (np.abs(self.qd) < RELEASE_STILL)
+        self.q_cmd = np.where(press, q - np.sign(d) * RELEASE_BACKOFF, self.q_cmd)
 
     def grip(self, trigger, dt):
         g = self.calib.get("grip")
@@ -428,7 +439,7 @@ class Brain:
             H = (m.get("hands") or {}).get(hand)
             if not H:
                 if a.engaged:
-                    a.engaged = False
+                    a.release()
                     self.say(f"{hand}: controller gone, holding")
                 continue
             b = H.get("b", [0, 0, 0])
@@ -457,7 +468,7 @@ class Brain:
                 if math.hypot(ax, az) > 0.3:
                     self.yaw = -math.atan2(-ax, -az)
                     for o in self.arms.values():
-                        o.engaged = False
+                        o.release()
                     self.aligned = True
                     self.say(f"aligned: robot forward = controller direction (yaw {math.degrees(self.yaw):+.0f} deg)")
                     self.event("align", yaw=self.yaw)
@@ -480,8 +491,7 @@ class Brain:
             a.clutch = sq > SQ_OFF if was else sq > SQ_ON
             if not a.clutch or not ok:
                 if a.engaged:
-                    a.engaged = False
-                    a.settle()
+                    a.release()
                     self.event("release", arm=hand, why="tracking lost" if not ok else "squeeze released")
                     if not ok:
                         self.say(f"{hand}: tracking lost, holding")
@@ -561,12 +571,12 @@ class Brain:
         elif cmd == "xr_start":
             self.xr_active, self.aligned = True, False
             for a in self.arms.values():
-                a.engaged = False
+                a.release()
             self.say("AR started: press B to align")
         elif cmd == "xr_end":
             self.xr_active = False
             for a in self.arms.values():
-                a.engaged = False
+                a.release()
             self.say("AR ended: arms hold")
 
     def status(self):
@@ -632,7 +642,7 @@ class Brain:
         if held := [n for n in used if arms[n]["mode"] == "hold"]:
             return out(f"{name(held)} arm paused", [self.plain(arms[held[0]]["msg"]),
                                                      "Squeeze again to continue, or press Y to stop."], "warn")
-        if self.xr_active and not self.aligned:
+        if not self.aligned and (self.xr_active or time.monotonic() - self.last_xr < 1.0):
             return out("Press B to align", ["Stand beside the robot, facing the way it faces.",
                                             "Point the RIGHT controller straight ahead, then press B."], "info")
         if driving := [n for n in used if self.arms[n].engaged]:
@@ -675,7 +685,7 @@ class Brain:
             if now - self.last_xr > XR_TIMEOUT:
                 for a in self.arms.values():
                     if a.engaged:
-                        a.engaged = False
+                        a.release()
                         self.say(f"{a.name}: no headset data, holding")
             if now - self.last_send > 0.035:
                 self.send_targets()
@@ -733,7 +743,9 @@ async def ws_handler(request):
                 continue
             try:
                 m = json.loads(msg.data, parse_constant=reject_nan)
-            except ValueError:
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(m, dict):
                 continue
             if m.get("t") == "xr":
                 brain.last_remote = request.remote
@@ -747,7 +759,7 @@ async def ws_handler(request):
         if brain.xr_ws is ws:  # the AR page went away without saying 'xr_end'
             brain.xr_ws, brain.xr_active = None, False
             for a in brain.arms.values():
-                a.engaged = False
+                a.release()
         brain.say(f"page disconnected ({request.remote})")
     return ws
 

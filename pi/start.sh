@@ -7,7 +7,9 @@
 # the headset isn't ready yet).
 cd "$(dirname "$0")/.." || exit 1
 ARMS="${1:-left,right}"
-IP=$(hostname -I | awk '{print $1}')
+# the address the Pi reaches the network with (the first address if there is no route out)
+IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}')
+[ -n "$IP" ] || IP=$(hostname -I | awk '{print $1}')
 
 echo "stopping running copies (arms park first if on)..."
 sudo pkill -INT -f "^.venv/bin/python pi/motor_loop.py"
@@ -24,7 +26,7 @@ sleep 2
 sudo setsid nohup .venv/bin/python pi/motor_loop.py --arms "$ARMS" > /tmp/loop.log 2>&1 &
 
 echo "USB link to the headset..."
-for p in $(pgrep -f "pi/headset_link.sh"); do kill "$p"; done  # a retry left from an earlier start
+for p in $(pgrep -f "^sh pi/headset_link.sh"); do kill "$p"; done  # a retry left from an earlier start
 adb kill-server >/dev/null 2>&1
 sudo adb start-server >/dev/null 2>&1
 timeout 5 adb wait-for-device 2>/dev/null  # the adb server needs a moment to find the headset

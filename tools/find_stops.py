@@ -226,9 +226,6 @@ def main():
             lim = raw[arm].setdefault("limits_deg", {})
             for j, r in joints.items():
                 lim[str(j)] = r
-            raw[arm].setdefault("notes", "")
-            raw[arm]["notes"] += f" {time.strftime('%Y-%m-%d %H:%M')} find_stops: " + ", ".join(
-                f"J{j} {r[0]:+.1f}..{r[1]:+.1f}" for j, r in sorted(joints.items())) + "."
         tmp = kin.CALIB_PATH + ".tmp"
         with open(tmp, "w") as f:
             f.write(json.dumps(raw, indent=2) + "\n")

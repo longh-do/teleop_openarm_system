@@ -8,7 +8,9 @@ LOG="${BRAIN_LOG:-/tmp/brain.log}"
 end=$(($(date +%s) + WAIT))
 until adb devices | grep -q "device$"; do
   if [ "$(date +%s)" -ge "$end" ]; then
-    echo "  headset not on USB (or USB debugging not allowed): use https://$(hostname -I | awk '{print $1}'):8443"
+    IP=$(ip route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") {print $(i + 1); exit}}')
+    [ -n "$IP" ] || IP=$(hostname -I | awk '{print $1}')
+    echo "  headset not on USB (or USB debugging not allowed): use https://$IP:8443"
     exit 1
   fi
   sleep 2

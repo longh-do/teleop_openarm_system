@@ -3,7 +3,8 @@
 
   sudo ip link add dev vcan0 type vcan && sudo ip link set vcan0 up
   python3 tools/fake_motors.py vcan0 --drop-j1 3.0     # J1 also drops its replies for ~35 ms every 3 s
-Answers enable/disable/clear, position-velocity (0x100+j), MIT (j), and register reads and writes (0x7FF, 0x33/0x55).
+Answers enable/disable/clear, position-velocity (0x100+j) and MIT (j) frames and register reads (0x7FF, 0x33);
+register writes (0x55) are stored and read back.
 """
 import argparse
 import math

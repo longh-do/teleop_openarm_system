@@ -6,4 +6,3 @@ build/
 logs/
 *.local.toml
 certs/
-pi/align.json

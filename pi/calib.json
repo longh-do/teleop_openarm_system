@@ -41,7 +41,7 @@
       "closed": -0.52
     },
     "verified": true,
-    "notes": "Model zero: the arm hanging straight down. model angle = sign * motor angle + offset_deg; the offsets are minus the motor angles read while hanging, except J5, whose zero is a quarter turn from the hanging forearm (offset = 90 - rest). Every sign was checked by moving one joint at a time and comparing with the model. limits_deg (model degrees) override the model's limits where the real end stop is closer: J4 is the elbow's fold stop, J5-J7 were measured with tools/find_stops.py. grip: the gripper motor's open and closed stops (motor rad), from tools/grip_stops.py."
+    "notes": "Model zero: the arm hanging straight down. model angle = sign * motor angle + offset_deg; the offsets are minus the motor angles read while hanging, except J5, whose zero is a quarter turn from the hanging forearm (offset = 90 - rest). Every sign was checked by moving one joint at a time and comparing with the model. limits_deg (model degrees) replace the model's limits with the real end stops: J4 is the elbow's fold stop, J5-J7 were measured with tools/find_stops.py. grip: the gripper motor's open and closed stops (motor rad), from tools/grip_stops.py."
   },
   "left": {
     "sign": [
@@ -85,6 +85,6 @@
       "closed": -0.54
     },
     "verified": true,
-    "notes": "Model zero: the arm hanging straight down. model angle = sign * motor angle + offset_deg; the offsets are minus the motor angles read while hanging, except J5, whose zero is a quarter turn from the hanging forearm (mirrored: offset = -90 - rest). Every sign was checked by moving one joint at a time and comparing with the model. limits_deg (model degrees) override the model's limits where the real end stop is closer: J4 is the elbow's fold stop, J5-J7 were measured with tools/find_stops.py. grip: the gripper motor's open and closed stops (motor rad), from tools/grip_stops.py."
+    "notes": "Model zero: the arm hanging straight down. model angle = sign * motor angle + offset_deg; the offsets are minus the motor angles read while hanging, except J5, whose zero is a quarter turn from the hanging forearm (mirrored: offset = -90 - rest). Every sign was checked by moving one joint at a time and comparing with the model. limits_deg (model degrees) replace the model's limits with the real end stops: J4 is the elbow's fold stop, J5-J7 were measured with tools/find_stops.py. grip: the gripper motor's open and closed stops (motor rad), from tools/grip_stops.py."
   }
 }
