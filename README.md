@@ -9,21 +9,6 @@ Teleoperate both arms of an [OpenArm](https://openarm.dev) robot with a **Meta Q
 - **A guide panel inside the headset** that tells the operator what to do next, plus haptic cues.
 - **A simulator and calibration tools.**
 
-## How it works
-
-```
-Quest browser (WebXR, passthrough, ~90 Hz controller poses)
-   │  WebSocket: HTTPS over Wi-Fi, or HTTP over the USB cable (adb reverse)
-   ▼
-pi/teleop_server.py   clutch, filtering, smooth follower, inverse kinematics, gripper, guide panel
-   │  UDP on localhost (joint targets ↓, telemetry ↑)
-   ▼
-pi/motor_loop.py      200 Hz real-time loop for both CAN buses, follower + latency lead, safety holds
-   │  SocketCAN, classic CAN 1 Mbit/s (one DM-USB2FDCAN adapter, two buses)
-   ▼
-2 × OpenArm: 8 DAMIAO motors each (J1–J7 position-velocity mode, J8 gripper MIT mode)
-```
-
 ## Hardware
 
 - Two OpenArm arms. Each has DM8009 shoulders (J1, J2), DM4340 upper-arm twist and elbow (J3, J4), and DM4310 wrist and gripper motors (J5–J8).
@@ -136,24 +121,3 @@ sudo .venv/bin/python pi/motor_loop.py --buses right=vcan0 --arms right &
 ```
 
 `tools/hud_flow_test.py` walks the whole operator flow (AR start, align, drive, release, STOP, power on) and prints what the headset panel would say. Run it against a server started with `--port 8444`. `tools/quest_cdp.py` shows the page's console from inside the headset over USB.
-
-## Repository layout
-
-| Path | What it is |
-|---|---|
-| `pi/motor_loop.py` | The only program that talks to the motors. Per cycle it sends one arm's frames and waits for that arm's replies, then does the other arm (the shared adapter drops replies when both bursts overlap). |
-| `pi/teleop_server.py` | Serves the headset page and its WebSocket; clutch, filtering, IK, gripper, guide panel. `POST /cmd` accepts `stop` and `power_on`. |
-| `pi/kinematics.py` | Forward and inverse kinematics for both arms (numpy). |
-| `pi/damiao.py` | DAMIAO CAN protocol: frame packing, reply decoding, register access. |
-| `pi/calib.json`, `pi/gains.json` | Calibration and motor gains (see above). |
-| `pi/start.sh`, `pi/setup.sh`, `pi/headset_link.sh` | Start everything, one-time setup, USB link to the headset. |
-| `quest/index.html` | The headset page (plain HTML/JS, no build step). |
-| `tools/` | Simulator, calibration, tuning and debugging tools (above). |
-
-## Known limitations
-
-- **Wrist range:** the wrist bends much less than a human wrist (J6 about ±30–45°). When the gripper can't turn as far as your hand (a wrist joint at its end, or the arm straight), it stops there; the controller buzzes and the headset names the joint at its end. Turning further doesn't build up, so when you turn back the gripper follows at once; its angle relative to your hand has then shifted by the excess. Squeeze again to re-anchor.
-- **Straight arm:** with the arm straight, the hand can't move quickly along the arm's own direction (a kinematic singularity).
-- **Hard pushes:** pushing very hard (shoulder torques of about 17–30 Nm) can dip the motors' supply until a shoulder motor reboots. The arm then faults: press Y, then switch on again. A stronger power supply helps, and so does not driving the arms into the robot's own frame.
-- **No collision avoidance:** there is none, either between the arms or with the surroundings.
-- **Wi-Fi delays:** Wi-Fi adds occasional delays; the USB link is steadier.
