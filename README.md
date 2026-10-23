@@ -121,3 +121,7 @@ sudo .venv/bin/python pi/motor_loop.py --buses right=vcan0 --arms right &
 ```
 
 `tools/hud_flow_test.py` walks the whole operator flow (AR start, align, drive, release, STOP, power on) and prints what the headset panel would say. Run it against a server started with `--port 8444`. `tools/quest_cdp.py` shows the page's console from inside the headset over USB.
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE).
